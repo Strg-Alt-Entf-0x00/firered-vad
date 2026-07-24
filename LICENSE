@@ -1,0 +1,59 @@
+Custom Source-Available License
+================================
+
+FireRed-VAD v1.0.0
+Copyright (c) 2026 KernelMeltdown
+All Rights Reserved.
+
+PERMITTED USE (Free of Charge)
+-------------------------------
+This software may be freely used for:
+
+✓ Personal, non-commercial projects
+✓ Educational and academic purposes
+✓ Open source projects (non-commercial)
+✓ Research and development
+✓ Evaluation and testing
+✓ Hobby and learning projects
+
+PROHIBITED WITHOUT COMMERCIAL LICENSE
+--------------------------------------
+The following uses require a separate commercial license agreement:
+
+✗ Use in commercial products or services
+✗ Use in revenue-generating applications
+✗ Distribution as part of commercial software
+✗ Use by for-profit organizations
+✗ Integration into proprietary commercial systems
+
+COMMERCIAL LICENSING
+--------------------
+For commercial use, enterprise licensing, or custom arrangements:
+Please contact via GitHub: https://github.com/KernelMeltdown
+
+Flexible licensing terms available for businesses and commercial projects.
+
+TERMS AND CONDITIONS
+--------------------
+1. Attribution: You must provide appropriate credit to the author
+2. No Warranty: This software is provided "AS IS" without warranty
+3. Liability: The author is not liable for any damages
+4. Modifications: Personal modifications are allowed for permitted uses
+5. Redistribution: You may share this software with these license terms intact
+
+DEFINITION OF COMMERCIAL USE
+-----------------------------
+"Commercial use" means any use that is primarily intended for or directed 
+toward commercial advantage or monetary compensation, including:
+- Selling products or services that use this software
+- Using this software in a business environment
+- Providing software-as-a-service using this software
+- Internal business tools that generate revenue
+
+If you're unsure whether your use case requires a commercial license,
+please contact us - we're happy to clarify!
+
+---
+This is a custom source-available license. The source code is publicly 
+available for transparency, learning, and non-commercial use, while 
+commercial rights are reserved.
