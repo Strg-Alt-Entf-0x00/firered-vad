@@ -1,6 +1,6 @@
 # FireRed-VAD - State-of-the-Art Voice Activity Detection
 
-[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](https://github.com/KernelMeltdown/firered-vad)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](https://github.com/Strg-Alt-Entf-0x00/firered-vad)
 [![License](https://img.shields.io/badge/license-MIT%20%2B%20Apache%202.0-green.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C++-20-orange.svg)](https://isocpp.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
@@ -68,7 +68,7 @@ Mode is auto-detected from filename, or can be manually set in config.
 
 ### Windows
 ```cmd
-cd D:\AI-Projects\third-party-cpp\firered-vad-0.6.0
+cd D:\Third-party-cpp\firered-vad-0.6.0
 build.bat
 ```
 

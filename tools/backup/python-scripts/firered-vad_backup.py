@@ -17,18 +17,6 @@ def find_project_root(script_path: str) -> str:
     return os.path.abspath(os.path.join(os.path.dirname(script_path), '..', '..', '..'))
 
 
-def find_ai_projects_root(path: str) -> str | None:
-    cur = os.path.abspath(path)
-    while True:
-        base = os.path.basename(cur)
-        if base.lower() == 'ai-projects':
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return None
-        cur = parent
-
-
 def normalize_excludes(excludes: List[str]) -> List[str]:
     out = []
     for ex in excludes:
