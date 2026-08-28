@@ -9,6 +9,34 @@ logs/
 # Backup files
 tools/backup/backups/
 
+# Downloaded GGUF models
+gguf_models/
+*.gguf
+# Uncomment to also ignore debug JSON files:
+# *-debug.json
+
+# Downloaded PTH models
+pth_models/
+*.pth
+*.pth.tar
+*.ark
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Kiro IDE
+.kiro/
+
+# Project documentation (internal)
+.docs/
+
+# Generated test reports
+TEST_REPORT.md
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/

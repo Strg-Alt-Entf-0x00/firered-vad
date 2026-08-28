@@ -2,13 +2,7 @@
 REM Build script for firered-vad-0.6.0
 REM Usage: build.bat [release|debug|clean]
 
-:: Force English output BEFORE setlocal
-set VSLANG=1033
-set PreferredUILang=en-US
-
-setlocal enabledelayedexpansion
-
-chcp 437 >nul
+setlocal
 
 REM ============================================================================
 REM Configuration
