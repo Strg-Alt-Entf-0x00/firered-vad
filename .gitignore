@@ -10,13 +10,13 @@ logs/
 tools/backup/backups/
 
 # Downloaded GGUF models
-gguf_models/
+models_gguf/
 *.gguf
 # Uncomment to also ignore debug JSON files:
 # *-debug.json
 
 # Downloaded PTH models
-pth_models/
+models_pth/
 *.pth
 *.pth.tar
 *.ark

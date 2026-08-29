@@ -11,7 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Options
 option(firered_vad_BUILD_TESTS "Build FireRed VAD tests" OFF)
-option(firered_vad_BUILD_EXAMPLES "Build FireRed VAD examples" OFF)
+option(firered_vad_BUILD_EXAMPLES "Build FireRed VAD examples" ON)
 option(firered_vad_USE_CUDA "Enable CUDA support" ON)
 option(firered_vad_BUILD_SHARED "Build shared library" OFF)
 
@@ -54,10 +54,12 @@ endif()
 
 set(firered_vad_SOURCES
     src/firered_vad.cpp
+    src/firered_fbank.cpp
 )
 
 set(firered_vad_HEADERS
     include/firered-vad/firered_vad.h
+    src/firered_fbank.h
 )
 
 # ============================================================================

@@ -2,6 +2,7 @@
 // State-of-the-Art ML-based Voice Activity Detection
 
 #include "firered-vad/firered_vad.h"
+#include "firered_fbank.h"
 
 // Include GGML after our header to avoid conflicts
 #include "ggml.h"
@@ -44,23 +45,57 @@ struct fireredVADContext {
     // Operating mode
     fireredVADMode mode = fireredVADMode::Standard;
     
-    // RNN State (firered is RNN-based, needs state memory)
-    std::vector<float> rnn_state;
-    int rnn_state_size = 128;  // Will be set from model
+    // Model dimensions (will be detected from tensors)
+    int feature_dim = 80;      // Input features (Fbank)
+    int hidden_dim = 128;      // Hidden state dimension
+    int n_classes = 1;         // Output classes (1 for VAD, 3 for AED)
+    
+    // FSMN configuration
+    int lookback_order = 20;   // Lookback filter size (past context)
+    int lookahead_order = 20;  // Lookahead filter size (future context, 0 for streaming)
+    
+    // Feature extraction
+    firered::FbankExtractor* fbank_extractor = nullptr;
     
     // Model tensors (will be loaded from GGUF)
     struct {
-        // firered RNN architecture:
-        // - Input projection (audio features -> hidden)
-        // - RNN layers (LSTM or GRU)
-        // - Output projection (hidden -> probability)
-        ggml_tensor* input_proj_weight = nullptr;
-        ggml_tensor* input_proj_bias = nullptr;
-        ggml_tensor* rnn_weight_ih = nullptr;  // Input-hidden weights
-        ggml_tensor* rnn_weight_hh = nullptr;  // Hidden-hidden weights
-        ggml_tensor* rnn_bias = nullptr;
-        ggml_tensor* output_proj_weight = nullptr;
-        ggml_tensor* output_proj_bias = nullptr;
+        // FireRed-VAD uses DFSMN (Deep Feed-Forward Sequential Memory Network)
+        // NOT RNN! Architecture:
+        // 1. FC1: (80 → 256)
+        // 2. FC2: (256 → 128)
+        // 3. FSMN1: Lookback/lookahead filters
+        // 4. 7× FSMN blocks: Each with FC1(128→256), FC2(256→128), FSMN, residual
+        // 5. DNN: (128 → 128)
+        // 6. Output: (128 → n_classes)
+        
+        // Initial layers
+        ggml_tensor* fc1_weight = nullptr;  // dfsmn.fc1.0.weight
+        ggml_tensor* fc1_bias = nullptr;    // dfsmn.fc1.0.bias
+        ggml_tensor* fc2_weight = nullptr;  // dfsmn.fc2.0.weight
+        ggml_tensor* fc2_bias = nullptr;    // dfsmn.fc2.0.bias
+        
+        // FSMN1 filters
+        ggml_tensor* fsmn1_lookback = nullptr;   // dfsmn.fsmn1.lookback_filter.weight
+        ggml_tensor* fsmn1_lookahead = nullptr;  // dfsmn.fsmn1.lookahead_filter.weight (may not exist for streaming)
+        
+        // FSMN blocks (0-6)
+        struct FSMNBlock {
+            ggml_tensor* fc1_weight = nullptr;
+            ggml_tensor* fc1_bias = nullptr;
+            ggml_tensor* fc2_weight = nullptr;
+            ggml_tensor* lookback_filter = nullptr;
+            ggml_tensor* lookahead_filter = nullptr;  // May be nullptr for streaming
+        } fsmn_blocks[7];
+        
+        // Final layers
+        ggml_tensor* dnn_weight = nullptr;  // dfsmn.dnns.0.weight
+        ggml_tensor* dnn_bias = nullptr;    // dfsmn.dnns.0.bias
+        ggml_tensor* out_weight = nullptr;  // out.weight
+        ggml_tensor* out_bias = nullptr;    // out.bias
+        
+        // CMVN statistics (for feature normalization)
+        ggml_tensor* cmvn_mean = nullptr;      // Optional: from metadata
+        ggml_tensor* cmvn_variance = nullptr;  // Optional: from metadata
     } model;
     
     // Configuration
@@ -153,12 +188,7 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
         std::cout << "[firered VAD] Architecture: " << ctx->architecture << std::endl;
     }
     
-    // Read RNN state size if available
-    key_idx = gguf_find_key(ctx->gguf_ctx, "firered.rnn_state_size");
-    if (key_idx >= 0) {
-        ctx->rnn_state_size = gguf_get_val_u32(ctx->gguf_ctx, key_idx);
-        std::cout << "[firered VAD] RNN state size: " << ctx->rnn_state_size << std::endl;
-    }
+    // DFSMN model - no RNN state needed (stateless)
     
     // Calculate total memory needed for model
     size_t total_size = 0;
@@ -221,28 +251,70 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
         
         // Map tensor name to model structure
         std::string name_str(tname);
-        if (name_str.find("input_proj.weight") != std::string::npos || name_str.find("input_proj_weight") != std::string::npos) {
-            ctx->model.input_proj_weight = tensor;
-            std::cout << "[firered VAD]   Loaded: input_proj_weight" << std::endl;
-        } else if (name_str.find("input_proj.bias") != std::string::npos || name_str.find("input_proj_bias") != std::string::npos) {
-            ctx->model.input_proj_bias = tensor;
-            std::cout << "[firered VAD]   Loaded: input_proj_bias" << std::endl;
-        } else if (name_str.find("rnn.weight_ih") != std::string::npos || name_str.find("rnn_weight_ih") != std::string::npos) {
-            ctx->model.rnn_weight_ih = tensor;
-            std::cout << "[firered VAD]   Loaded: rnn_weight_ih" << std::endl;
-        } else if (name_str.find("rnn.weight_hh") != std::string::npos || name_str.find("rnn_weight_hh") != std::string::npos) {
-            ctx->model.rnn_weight_hh = tensor;
-            std::cout << "[firered VAD]   Loaded: rnn_weight_hh" << std::endl;
-        } else if (name_str.find("rnn.bias") != std::string::npos || name_str.find("rnn_bias") != std::string::npos) {
-            ctx->model.rnn_bias = tensor;
-            std::cout << "[firered VAD]   Loaded: rnn_bias" << std::endl;
-        } else if (name_str.find("output_proj.weight") != std::string::npos || name_str.find("output_proj_weight") != std::string::npos) {
-            ctx->model.output_proj_weight = tensor;
-            std::cout << "[firered VAD]   Loaded: output_proj_weight" << std::endl;
-        } else if (name_str.find("output_proj.bias") != std::string::npos || name_str.find("output_proj_bias") != std::string::npos) {
-            ctx->model.output_proj_bias = tensor;
-            std::cout << "[firered VAD]   Loaded: output_proj_bias" << std::endl;
+        
+        // Initial FC layers
+        if (name_str == "dfsmn.fc1.0.weight") {
+            ctx->model.fc1_weight = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fc1.0.weight" << std::endl;
+        } else if (name_str == "dfsmn.fc1.0.bias") {
+            ctx->model.fc1_bias = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fc1.0.bias" << std::endl;
+        } else if (name_str == "dfsmn.fc2.0.weight") {
+            ctx->model.fc2_weight = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fc2.0.weight" << std::endl;
+        } else if (name_str == "dfsmn.fc2.0.bias") {
+            ctx->model.fc2_bias = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fc2.0.bias" << std::endl;
+        }
+        // FSMN1 filters
+        else if (name_str == "dfsmn.fsmn1.lookback_filter.weight") {
+            ctx->model.fsmn1_lookback = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fsmn1.lookback_filter.weight" << std::endl;
+        } else if (name_str == "dfsmn.fsmn1.lookahead_filter.weight") {
+            ctx->model.fsmn1_lookahead = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.fsmn1.lookahead_filter.weight" << std::endl;
+        }
+        // FSMN blocks (0-6)
+        else if (name_str.find("dfsmn.fsmns.") != std::string::npos) {
+            // Extract block index
+            size_t pos = name_str.find("dfsmn.fsmns.");
+            if (pos != std::string::npos) {
+                int block_idx = name_str[pos + 12] - '0';  // Get digit after "dfsmn.fsmns."
+                if (block_idx >= 0 && block_idx < 7) {
+                    if (name_str.find(".fc1.0.weight") != std::string::npos) {
+                        ctx->model.fsmn_blocks[block_idx].fc1_weight = tensor;
+                        std::cout << "[firered VAD]   Loaded: dfsmn.fsmns." << block_idx << ".fc1.0.weight" << std::endl;
+                    } else if (name_str.find(".fc1.0.bias") != std::string::npos) {
+                        ctx->model.fsmn_blocks[block_idx].fc1_bias = tensor;
+                        std::cout << "[firered VAD]   Loaded: dfsmn.fsmns." << block_idx << ".fc1.0.bias" << std::endl;
+                    } else if (name_str.find(".fc2.weight") != std::string::npos) {
+                        ctx->model.fsmn_blocks[block_idx].fc2_weight = tensor;
+                        std::cout << "[firered VAD]   Loaded: dfsmn.fsmns." << block_idx << ".fc2.weight" << std::endl;
+                    } else if (name_str.find(".fsmn.lookback_filter.weight") != std::string::npos) {
+                        ctx->model.fsmn_blocks[block_idx].lookback_filter = tensor;
+                        std::cout << "[firered VAD]   Loaded: dfsmn.fsmns." << block_idx << ".fsmn.lookback_filter.weight" << std::endl;
+                    } else if (name_str.find(".fsmn.lookahead_filter.weight") != std::string::npos) {
+                        ctx->model.fsmn_blocks[block_idx].lookahead_filter = tensor;
+                        std::cout << "[firered VAD]   Loaded: dfsmn.fsmns." << block_idx << ".fsmn.lookahead_filter.weight" << std::endl;
+                    }
+                }
+            }
+        }
+        // Final DNN and output layers
+        else if (name_str == "dfsmn.dnns.0.weight") {
+            ctx->model.dnn_weight = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.dnns.0.weight" << std::endl;
+        } else if (name_str == "dfsmn.dnns.0.bias") {
+            ctx->model.dnn_bias = tensor;
+            std::cout << "[firered VAD]   Loaded: dfsmn.dnns.0.bias" << std::endl;
+        } else if (name_str == "out.weight") {
+            ctx->model.out_weight = tensor;
+            std::cout << "[firered VAD]   Loaded: out.weight" << std::endl;
+        } else if (name_str == "out.bias") {
+            ctx->model.out_bias = tensor;
+            std::cout << "[firered VAD]   Loaded: out.bias" << std::endl;
         } else {
+            // Unknown tensor - just log it
             std::cout << "[firered VAD]   Tensor: " << tname << std::endl;
         }
     }
@@ -278,8 +350,34 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
     
     file.close();
     
-    // Initialize RNN state
-    ctx->rnn_state.resize(ctx->rnn_state_size, 0.0f);
+    // Detect model dimensions from tensors
+    if (ctx->model.fc1_weight) {
+        ctx->feature_dim = ctx->model.fc1_weight->ne[1];  // Input dimension
+        std::cout << "[firered VAD] Feature dimension: " << ctx->feature_dim << std::endl;
+    }
+    
+    if (ctx->model.fc2_weight) {
+        ctx->hidden_dim = ctx->model.fc2_weight->ne[0];  // Output dimension
+        std::cout << "[firered VAD] Hidden dimension: " << ctx->hidden_dim << std::endl;
+    }
+    
+    if (ctx->model.out_weight) {
+        ctx->n_classes = ctx->model.out_weight->ne[0];  // Number of output classes
+        std::cout << "[firered VAD] Output classes: " << ctx->n_classes << std::endl;
+    }
+    
+    if (ctx->model.fsmn1_lookback) {
+        ctx->lookback_order = ctx->model.fsmn1_lookback->ne[0];  // Filter size
+        std::cout << "[firered VAD] Lookback order: " << ctx->lookback_order << std::endl;
+    }
+    
+    if (ctx->model.fsmn1_lookahead) {
+        ctx->lookahead_order = ctx->model.fsmn1_lookahead->ne[0];  // Filter size
+        std::cout << "[firered VAD] Lookahead order: " << ctx->lookahead_order << std::endl;
+    } else {
+        ctx->lookahead_order = 0;  // Streaming mode
+        std::cout << "[firered VAD] No lookahead (streaming mode)" << std::endl;
+    }
     
     // Free meta context (no longer needed)
     if (meta_ctx) {
@@ -325,13 +423,98 @@ static std::vector<float> preprocess_audio(
     return result;
 }
 
-// Helper: Run RNN inference with GGML compute graph
+// Helper: Apply FSMN layer (Feed-Forward Sequential Memory Network)
+// FSMN uses 1D grouped convolutions for temporal modeling
+static struct ggml_tensor* apply_fsmn_layer(
+    ggml_context* ctx_compute,
+    struct ggml_tensor* input,  // Shape: (n_frames, hidden_dim)
+    struct ggml_tensor* lookback_filter,   // Shape: (hidden_dim, 1, lookback_order)
+    struct ggml_tensor* lookahead_filter   // Shape: (hidden_dim, 1, lookahead_order) or nullptr
+) {
+    int n_frames = input->ne[1];
+    int hidden_dim = input->ne[0];
+    
+    // FSMN operation:
+    // 1. Transpose input to (1, hidden_dim, n_frames) for conv1d
+    // 2. Apply grouped conv1d with lookback filter (past context)
+    // 3. Apply grouped conv1d with lookahead filter (future context, if exists)
+    // 4. Add to input (residual connection)
+    
+    // Reshape for conv1d: (n_frames, hidden_dim) → (1, hidden_dim, n_frames)
+    struct ggml_tensor* x_reshaped = ggml_cont(ctx_compute, ggml_permute(ctx_compute, input, 1, 0, 2, 3));
+    x_reshaped = ggml_reshape_3d(ctx_compute, x_reshaped, n_frames, hidden_dim, 1);
+    
+    // Apply lookback convolution (grouped conv1d)
+    int lookback_order = lookback_filter->ne[0];
+    
+    // Pad left for lookback (past context)
+    struct ggml_tensor* x_padded = ggml_pad(ctx_compute, x_reshaped, lookback_order - 1, 0, 0, 0);
+    
+    // Grouped 1D convolution for lookback
+    // GGML conv_1d parameters: (ctx, input, kernel, stride, padding, dilation)
+    struct ggml_tensor* lookback_out = ggml_conv_1d(ctx_compute, lookback_filter, x_padded, 1, 0, 1);
+    
+    // Reshape back to (n_frames, hidden_dim)
+    lookback_out = ggml_cont(ctx_compute, ggml_permute(ctx_compute, 
+        ggml_reshape_2d(ctx_compute, lookback_out, n_frames, hidden_dim), 1, 0, 2, 3));
+    
+    // Apply lookahead convolution if exists (non-streaming mode)
+    struct ggml_tensor* result = ggml_add(ctx_compute, input, lookback_out);
+    
+    if (lookahead_filter != nullptr) {
+        int lookahead_order = lookahead_filter->ne[0];
+        
+        // Pad right for lookahead (future context)
+        struct ggml_tensor* x_padded_ahead = ggml_pad(ctx_compute, x_reshaped, 0, lookahead_order - 1, 0, 0);
+        
+        // Grouped 1D convolution for lookahead (reversed filter)
+        struct ggml_tensor* lookahead_out = ggml_conv_1d(ctx_compute, lookahead_filter, x_padded_ahead, 1, 0, 1);
+        
+        // Reshape back
+        lookahead_out = ggml_cont(ctx_compute, ggml_permute(ctx_compute,
+            ggml_reshape_2d(ctx_compute, lookahead_out, n_frames, hidden_dim), 1, 0, 2, 3));
+        
+        // Add lookahead to result
+        result = ggml_add(ctx_compute, result, lookahead_out);
+    }
+    
+    return result;
+}
+
+// Helper: Apply one FSMN block
+// Helper: Apply FSMN block (FC1 → FC2 → FSMN → Residual)
+static struct ggml_tensor* apply_fsmn_block(
+    ggml_context* ctx_compute,
+    struct ggml_tensor* input,  // Shape: (n_frames, 128)
+    const decltype(fireredVADContext::model)::FSMNBlock& block
+) {
+    // Save for residual connection
+    struct ggml_tensor* residual = input;
+    
+    // FC1: (128 → 256) with ReLU
+    struct ggml_tensor* x = ggml_mul_mat(ctx_compute, block.fc1_weight, input);
+    x = ggml_add(ctx_compute, x, block.fc1_bias);
+    x = ggml_relu(ctx_compute, x);
+    
+    // FC2: (256 → 128) linear
+    x = ggml_mul_mat(ctx_compute, block.fc2_weight, x);
+    
+    // FSMN: Apply memory filters
+    x = apply_fsmn_layer(ctx_compute, x, block.lookback_filter, block.lookahead_filter);
+    
+    // Residual connection
+    x = ggml_add(ctx_compute, x, residual);
+    
+    return x;
+}
+
+// Helper: Run DFSMN inference with GGML compute graph
 // Returns speech probability for Standard/Streaming modes
 // For AED mode, returns probabilities in a struct (passed separately)
 static float run_firered_inference(
     fireredVADContext* ctx,
-    const float* audio_frame,
-    int frame_samples,
+    const float* features,  // Fbank features (n_frames, 80) - already extracted
+    int n_frames,
     fireredAEDResult* aed_result = nullptr
 ) {
     if (!ctx->ctx_model) {
@@ -342,7 +525,7 @@ static float run_firered_inference(
     // Create compute context if not exists
     if (!ctx->ctx_compute) {
         // Allocate enough memory for compute graph
-        size_t compute_size = 16 * 1024 * 1024;  // 16 MB should be enough
+        size_t compute_size = 64 * 1024 * 1024;  // 64 MB for DFSMN
         struct ggml_init_params params = {
             /* .mem_size = */ compute_size,
             /* .mem_buffer = */ nullptr,
@@ -355,97 +538,85 @@ static float run_firered_inference(
         }
     }
     
-    // Build compute graph for forward pass
-    // Note: This is a simplified RNN inference - actual firered architecture may differ
-    // TODO: Update based on actual firered model architecture once we have the GGUF file
+    // Build DFSMN forward pass compute graph
     
-    // 1. Create input tensor from audio frame
-    struct ggml_tensor* input = ggml_new_tensor_1d(ctx->ctx_compute, GGML_TYPE_F32, frame_samples);
-    ggml_backend_tensor_set(input, audio_frame, 0, frame_samples * sizeof(float));
-    ggml_set_name(input, "input");
+    // 1. Create input tensor: (n_frames, 80)
+    struct ggml_tensor* x = ggml_new_tensor_2d(ctx->ctx_compute, GGML_TYPE_F32, ctx->feature_dim, n_frames);
+    ggml_backend_tensor_set(x, features, 0, n_frames * ctx->feature_dim * sizeof(float));
+    ggml_set_name(x, "input_features");
     
-    // 2. Input projection (if model has it)
-    struct ggml_tensor* hidden = input;
-    if (ctx->model.input_proj_weight) {
-        hidden = ggml_mul_mat(ctx->ctx_compute, ctx->model.input_proj_weight, input);
-        if (ctx->model.input_proj_bias) {
-            hidden = ggml_add(ctx->ctx_compute, hidden, ctx->model.input_proj_bias);
-        }
-        ggml_set_name(hidden, "projected");
+    // 2. FC1: (80 → 256) with ReLU
+    x = ggml_mul_mat(ctx->ctx_compute, ctx->model.fc1_weight, x);
+    x = ggml_add(ctx->ctx_compute, x, ctx->model.fc1_bias);
+    x = ggml_relu(ctx->ctx_compute, x);
+    ggml_set_name(x, "fc1_out");
+    
+    // 3. FC2: (256 → 128) with ReLU
+    x = ggml_mul_mat(ctx->ctx_compute, ctx->model.fc2_weight, x);
+    x = ggml_add(ctx->ctx_compute, x, ctx->model.fc2_bias);
+    x = ggml_relu(ctx->ctx_compute, x);
+    ggml_set_name(x, "fc2_out");
+    
+    // 4. FSMN1: Initial memory layer
+    x = apply_fsmn_layer(ctx->ctx_compute, x, ctx->model.fsmn1_lookback, ctx->model.fsmn1_lookahead);
+    ggml_set_name(x, "fsmn1_out");
+    
+    // 5. FSMN blocks 0-6: Each with FC1, FC2, FSMN, residual
+    for (int i = 0; i < 7; i++) {
+        x = apply_fsmn_block(ctx->ctx_compute, x, ctx->model.fsmn_blocks[i]);
+        ggml_set_name(x, ("fsmn_block_" + std::to_string(i)).c_str());
     }
     
-    // 3. RNN layer (simplified GRU/LSTM)
-    // For now, implement a basic RNN cell: h_new = tanh(W_ih * x + W_hh * h + b)
-    if (ctx->model.rnn_weight_ih && ctx->model.rnn_weight_hh) {
-        // Create RNN state tensor
-        struct ggml_tensor* rnn_state = ggml_new_tensor_1d(ctx->ctx_compute, GGML_TYPE_F32, ctx->rnn_state_size);
-        ggml_backend_tensor_set(rnn_state, ctx->rnn_state.data(), 0, ctx->rnn_state_size * sizeof(float));
-        ggml_set_name(rnn_state, "rnn_state");
-        
-        // Compute: W_ih * input
-        struct ggml_tensor* ih = ggml_mul_mat(ctx->ctx_compute, ctx->model.rnn_weight_ih, hidden);
-        
-        // Compute: W_hh * hidden_state
-        struct ggml_tensor* hh = ggml_mul_mat(ctx->ctx_compute, ctx->model.rnn_weight_hh, rnn_state);
-        
-        // Add together
-        struct ggml_tensor* combined = ggml_add(ctx->ctx_compute, ih, hh);
-        
-        // Add bias if exists
-        if (ctx->model.rnn_bias) {
-            combined = ggml_add(ctx->ctx_compute, combined, ctx->model.rnn_bias);
-        }
-        
-        // Apply activation (tanh for basic RNN)
-        hidden = ggml_tanh(ctx->ctx_compute, combined);
-        ggml_set_name(hidden, "rnn_output");
-        
-        // Save new state (will be read back after compute)
-    }
+    // 6. DNN layer: (128 → 128) with ReLU
+    x = ggml_mul_mat(ctx->ctx_compute, ctx->model.dnn_weight, x);
+    x = ggml_add(ctx->ctx_compute, x, ctx->model.dnn_bias);
+    x = ggml_relu(ctx->ctx_compute, x);
+    ggml_set_name(x, "dnn_out");
     
-    // 4. Output projection
-    struct ggml_tensor* output = hidden;
-    if (ctx->model.output_proj_weight) {
-        output = ggml_mul_mat(ctx->ctx_compute, ctx->model.output_proj_weight, hidden);
-        if (ctx->model.output_proj_bias) {
-            output = ggml_add(ctx->ctx_compute, output, ctx->model.output_proj_bias);
-        }
-        ggml_set_name(output, "output");
-    }
-    
-    // 5. Apply sigmoid to get probability [0, 1]
-    output = ggml_sigmoid(ctx->ctx_compute, output);
-    ggml_set_name(output, "probability");
+    // 7. Output layer: (128 → n_classes) with Sigmoid
+    x = ggml_mul_mat(ctx->ctx_compute, ctx->model.out_weight, x);
+    x = ggml_add(ctx->ctx_compute, x, ctx->model.out_bias);
+    x = ggml_sigmoid(ctx->ctx_compute, x);
+    ggml_set_name(x, "output");
     
     // Build forward pass graph
     struct ggml_cgraph* gf = ggml_new_graph(ctx->ctx_compute);
-    ggml_build_forward_expand(gf, output);
+    ggml_build_forward_expand(gf, x);
     
     // Execute compute graph on backend
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
-        set_error("Failed to compute inference graph");
+        set_error("Failed to compute DFSMN inference graph");
         return 0.0f;
     }
     
     // Read result based on mode
-    if (ctx->mode == fireredVADMode::AED && aed_result) {
-        // AED mode: Read 3 probabilities (speech, music, singing)
-        float probs[3] = {0.0f, 0.0f, 0.0f};
-        size_t output_elements = static_cast<size_t>(ggml_nelements(output));
-        size_t output_size = std::min(size_t(3), output_elements) * sizeof(float);
-        ggml_backend_tensor_get(output, probs, 0, output_size);
+    // Output shape: (n_frames, n_classes)
+    // We'll average over all frames for now (can be changed for frame-level output)
+    
+    std::vector<float> output_data(n_frames * ctx->n_classes);
+    ggml_backend_tensor_get(x, output_data.data(), 0, output_data.size() * sizeof(float));
+    
+    if (ctx->mode == fireredVADMode::AED && aed_result && ctx->n_classes == 3) {
+        // AED mode: Average 3 probabilities (speech, music, singing) over all frames
+        float speech_sum = 0.0f, music_sum = 0.0f, singing_sum = 0.0f;
+        for (int i = 0; i < n_frames; i++) {
+            speech_sum += output_data[i * 3 + 0];
+            music_sum += output_data[i * 3 + 1];
+            singing_sum += output_data[i * 3 + 2];
+        }
         
-        aed_result->speech_prob = probs[0];
-        aed_result->music_prob = probs[1];
-        aed_result->singing_prob = probs[2];
+        aed_result->speech_prob = speech_sum / n_frames;
+        aed_result->music_prob = music_sum / n_frames;
+        aed_result->singing_prob = singing_sum / n_frames;
         
-        // Return speech probability as primary result
-        return probs[0];
+        return aed_result->speech_prob;
     } else {
-        // Standard/Streaming mode: Single probability
-        float result = 0.0f;
-        ggml_backend_tensor_get(output, &result, 0, sizeof(float));
-        return result;
+        // Standard/Streaming mode: Average single probability over frames
+        float prob_sum = 0.0f;
+        for (int i = 0; i < n_frames; i++) {
+            prob_sum += output_data[i];
+        }
+        return prob_sum / n_frames;
     }
 }
 
@@ -503,10 +674,25 @@ fireredVADContext* firered_vad_init(const char* model_path, const fireredVADConf
         return nullptr;
     }
     
+    // Initialize Fbank feature extractor
+    firered::FbankConfig fbank_config;
+    fbank_config.sample_rate = ctx->config.sample_rate_hz;
+    fbank_config.frame_length_ms = 25;  // Standard for speech
+    fbank_config.frame_shift_ms = 10;   // Standard for speech
+    fbank_config.num_mel_bins = ctx->feature_dim;  // 80 for FireRed-VAD
+    fbank_config.num_fft_bins = 512;
+    fbank_config.low_freq = 20.0f;
+    fbank_config.high_freq = 8000.0f;
+    
+    ctx->fbank_extractor = new firered::FbankExtractor(fbank_config);
+    
     std::cout << "[firered VAD] Initialized successfully" << std::endl;
     std::cout << "[firered VAD]   Sample rate: " << ctx->config.sample_rate_hz << " Hz" << std::endl;
-    std::cout << "[firered VAD]   Frame size: " << ctx->config.frame_size_ms << " ms (30ms for firered)" << std::endl;
-    std::cout << "[firered VAD]   RNN state size: " << ctx->rnn_state_size << std::endl;
+    std::cout << "[firered VAD]   Frame size: " << ctx->config.frame_size_ms << " ms" << std::endl;
+    std::cout << "[firered VAD]   Architecture: DFSMN (Deep Feed-Forward Sequential Memory Network)" << std::endl;
+    std::cout << "[firered VAD]   Feature dim: " << ctx->feature_dim << std::endl;
+    std::cout << "[firered VAD]   Hidden dim: " << ctx->hidden_dim << std::endl;
+    std::cout << "[firered VAD]   Output classes: " << ctx->n_classes << std::endl;
     std::cout << "[firered VAD]   Backend: " << (ctx->config.use_gpu ? "CUDA" : "CPU") << std::endl;
     
     return ctx;
@@ -523,34 +709,35 @@ float firered_vad_detect(
         return -1.0f;
     }
     
-    // Preprocess audio
-    auto audio = preprocess_audio(audio_samples, n_samples, sample_rate_hz, ctx->config.sample_rate_hz);
+    // Resample if necessary (for now, just check and warn)
+    if (sample_rate_hz != ctx->config.sample_rate_hz) {
+        std::cerr << "[firered VAD] WARNING: Sample rate mismatch. "
+                  << "Expected " << ctx->config.sample_rate_hz << " Hz, got " 
+                  << sample_rate_hz << " Hz. Resampling not implemented yet." << std::endl;
+    }
     
-    // Process entire audio buffer
-    // For simplicity, we'll average probabilities across all frames
+    // Extract Fbank features
+    auto features = ctx->fbank_extractor->ExtractFeatures(audio_samples, n_samples);
     
-    int frame_size_samples = (ctx->config.frame_size_ms * ctx->config.sample_rate_hz) / 1000;
-    int hop_size_samples = (ctx->config.hop_size_ms * ctx->config.sample_rate_hz) / 1000;
-    
-    if (frame_size_samples > static_cast<int>(audio.size())) {
-        // Audio too short for even one frame
+    if (features.empty()) {
+        std::cerr << "[firered VAD] WARNING: No features extracted (audio too short?)" << std::endl;
         return 0.0f;
     }
     
-    float total_prob = 0.0f;
-    int frame_count = 0;
+    int n_frames = static_cast<int>(features.size());
     
-    for (int i = 0; i + frame_size_samples <= static_cast<int>(audio.size()); i += hop_size_samples) {
-        float prob = run_firered_inference(ctx, audio.data() + i, frame_size_samples);
-        total_prob += prob;
-        frame_count++;
+    // Convert features to flat array for inference
+    std::vector<float> features_flat(n_frames * ctx->feature_dim);
+    for (int i = 0; i < n_frames; i++) {
+        for (int j = 0; j < ctx->feature_dim; j++) {
+            features_flat[i * ctx->feature_dim + j] = features[i][j];
+        }
     }
     
-    if (frame_count == 0) {
-        return 0.0f;
-    }
+    // Run DFSMN inference
+    float prob = run_firered_inference(ctx, features_flat.data(), n_frames);
     
-    return total_prob / frame_count;
+    return prob;
 }
 
 bool firered_vad_detect_frames(
@@ -565,26 +752,36 @@ bool firered_vad_detect_frames(
         return false;
     }
     
-    // Preprocess audio
-    auto audio = preprocess_audio(audio_samples, n_samples, sample_rate_hz, ctx->config.sample_rate_hz);
-    
-    int frame_size_samples = (ctx->config.frame_size_ms * ctx->config.sample_rate_hz) / 1000;
-    int hop_size_samples = (ctx->config.hop_size_ms * ctx->config.sample_rate_hz) / 1000;
-    
-    // Calculate number of frames
-    int n_frames = 0;
-    for (int i = 0; i + frame_size_samples <= static_cast<int>(audio.size()); i += hop_size_samples) {
-        n_frames++;
+    // Resample if necessary
+    if (sample_rate_hz != ctx->config.sample_rate_hz) {
+        std::cerr << "[firered VAD] WARNING: Sample rate mismatch." << std::endl;
     }
     
-    frame_probabilities.resize(n_frames);
+    // Extract Fbank features
+    auto features = ctx->fbank_extractor->ExtractFeatures(audio_samples, n_samples);
     
-    // Run inference per frame
-    int frame_idx = 0;
-    for (int i = 0; i + frame_size_samples <= static_cast<int>(audio.size()); i += hop_size_samples) {
-        float prob = run_firered_inference(ctx, audio.data() + i, frame_size_samples);
-        frame_probabilities[frame_idx++] = prob;
+    if (features.empty()) {
+        frame_probabilities.clear();
+        return true;
     }
+    
+    int n_frames = static_cast<int>(features.size());
+    
+    // Convert features to flat array
+    std::vector<float> features_flat(n_frames * ctx->feature_dim);
+    for (int i = 0; i < n_frames; i++) {
+        for (int j = 0; j < ctx->feature_dim; j++) {
+            features_flat[i * ctx->feature_dim + j] = features[i][j];
+        }
+    }
+    
+    // Run DFSMN inference (currently returns averaged probability)
+    // TODO: Modify run_firered_inference to return per-frame probabilities
+    float avg_prob = run_firered_inference(ctx, features_flat.data(), n_frames);
+    
+    // For now, return same probability for all frames
+    // In production, modify run_firered_inference to return frame-level output
+    frame_probabilities.resize(n_frames, avg_prob);
     
     return true;
 }
@@ -678,10 +875,10 @@ void firered_vad_reset(fireredVADContext* ctx) {
         return;
     }
     
-    // Reset RNN state to zeros
-    std::fill(ctx->rnn_state.begin(), ctx->rnn_state.end(), 0.0f);
+    // DFSMN is stateless - no hidden state to reset
+    // This function is kept for API compatibility but does nothing
     
-    std::cout << "[firered VAD] RNN state reset" << std::endl;
+    std::cout << "[firered VAD] Reset called (DFSMN is stateless, no operation needed)" << std::endl;
 }
 
 std::vector<std::pair<int, int>> firered_vad_segment(
@@ -856,6 +1053,12 @@ fireredAEDResult firered_aed_detect(
 void firered_vad_free(fireredVADContext* ctx) {
     if (!ctx) {
         return;
+    }
+    
+    // Free fbank extractor
+    if (ctx->fbank_extractor) {
+        delete ctx->fbank_extractor;
+        ctx->fbank_extractor = nullptr;
     }
     
     if (ctx->buffer_compute) {

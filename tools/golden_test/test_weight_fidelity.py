@@ -347,7 +347,7 @@ def main():
     parser.add_argument('--pth-dir', type=Path, default=None,
                         help='Directory containing PTH models (default: ../../pth_models)')
     parser.add_argument('--gguf-dir', type=Path, default=None,
-                        help='Directory containing GGUF models (default: ../../gguf_models)')
+                        help='Directory containing GGUF models (default: ../../models_gguf)')
     parser.add_argument('--verbose', action='store_true',
                         help='Verbose output')
     
@@ -355,9 +355,9 @@ def main():
     
     # Default directories
     if args.pth_dir is None:
-        args.pth_dir = Path(__file__).parent.parent.parent / "pth_models"
+        args.pth_dir = Path(__file__).parent.parent.parent / "models_pth"
     if args.gguf_dir is None:
-        args.gguf_dir = Path(__file__).parent.parent.parent / "gguf_models"
+        args.gguf_dir = Path(__file__).parent.parent.parent / "models_gguf"
     
     # Verify directories exist
     if not args.pth_dir.exists():

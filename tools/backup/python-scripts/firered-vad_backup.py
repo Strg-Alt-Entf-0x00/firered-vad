@@ -28,6 +28,19 @@ def normalize_excludes(excludes: List[str]) -> List[str]:
 def is_excluded(abs_path: str, project_root: str, excludes: List[str]) -> bool:
     rel = os.path.relpath(abs_path, project_root)
     rel = rel.replace('\\', '/').replace('\\', '/')
+    
+    # Exclude directories starting with dot (e.g., .git, .docs, .vscode)
+    # Only check directory names, not the final filename
+    path_parts = rel.split('/')
+    # Check all parts except the last one (which might be a file)
+    for i, part in enumerate(path_parts[:-1]):  # Don't check the last part (filename)
+        if part.startswith('.'):
+            return True
+    
+    # Also check if the path itself is a directory and starts with dot
+    if os.path.isdir(abs_path) and path_parts and path_parts[-1].startswith('.'):
+        return True
+    
     for ex in excludes:
         ex_norm = ex.replace('\\', '/').replace('\\', '/').rstrip('/')
         if rel == ex_norm or rel.startswith(ex_norm + '/'):
@@ -85,8 +98,38 @@ def main() -> int:
     import re
     safe_project = re.sub(r'-\d+\.\d+\.\d+$', '', safe_project)
 
-    default_excludes = ['models', 'docs', 'build', 'tools/backup', 'backup', 'logs', '.git', '.vs', '.vscode', '__pycache__']
-    default_file_excludes = ['.md', '.log']
+    # Default exclusions - updated for new structure
+    default_excludes = [
+        # Model directories (large files, not needed in backup)
+        'models_pth',
+        'models_gguf',
+        'pth_models',      # old name (backwards compatibility)
+        'gguf_models',     # old name (backwards compatibility)
+        
+        # Build and temporary directories
+        'build',
+        'hf_staging',      # HuggingFace upload staging
+        
+        # Backup directories
+        'tools/backup',
+        'backup',
+        
+        # Logs and cache
+        'logs',
+        '__pycache__',
+        
+        # Version control and IDE
+        '.git',
+        '.vs',
+        '.vscode',
+        '.idea',
+        '.kiro',
+        
+        # Documentation (optional, comment out if you want to include)
+        '.docs',
+    ]
+    
+    default_file_excludes = ['.log', '.pyc', '.pyo']  # Removed .md - we want to keep source files!
     excludes = default_excludes + (args.exclude or [])
     excludes = normalize_excludes(excludes)
 

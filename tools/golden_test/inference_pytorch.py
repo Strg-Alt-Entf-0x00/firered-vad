@@ -92,10 +92,18 @@ class FireRedVADPyTorch:
         """
         Run forward pass through DFSMN network
         
-        NOTE: This is a simplified placeholder. Real implementation requires:
-        - Proper DFSMN architecture (memory blocks, convolutions)
-        - Layer-by-layer forward pass
-        - Activation functions (ReLU, Sigmoid)
+        DFSMN Architecture (Deep Feed-Forward Sequential Memory Network):
+        1. Input: (n_frames, 80) Fbank features (CMVN normalized)
+        2. FC1 layer: (80 → hidden_dim) with ReLU
+        3. FC2 layer: (hidden_dim → hidden_dim) with ReLU
+        4. FSMN1: Lookback/lookahead filters (memory mechanism)
+        5. FSMN blocks 0-6: Each has:
+           - FC1: (hidden_dim → hidden_dim) with ReLU
+           - FC2: (hidden_dim → hidden_dim) linear
+           - FSMN: Lookback/lookahead filters
+           - Residual connection
+        6. DNN layer: (hidden_dim → hidden_dim) with ReLU
+        7. Output layer: (hidden_dim → n_classes) with Sigmoid
         
         Args:
             features: Input features (n_frames, 80)
@@ -103,11 +111,165 @@ class FireRedVADPyTorch:
         Returns:
             Output probabilities (n_frames, n_classes)
         """
-        raise NotImplementedError(
-            "Full PyTorch DFSMN forward pass requires model architecture definition. "
-            "This is complex and should be implemented based on FireRedTeam's code. "
-            "For now, use this as a placeholder for golden test infrastructure."
+        # Convert to torch tensor
+        x = torch.from_numpy(features).float()
+        n_frames = x.shape[0]
+        
+        # Layer 1: FC1 (80 → 256)
+        fc1_weight = torch.from_numpy(self.weights['dfsmn.fc1.0.weight']).float()
+        fc1_bias = torch.from_numpy(self.weights['dfsmn.fc1.0.bias']).float()
+        x = torch.matmul(x, fc1_weight.T) + fc1_bias
+        x = torch.relu(x)
+        # DEBUG: print(f"After FC1: {x.shape}")
+        
+        # Layer 2: FC2 (256 → 128)
+        fc2_weight = torch.from_numpy(self.weights['dfsmn.fc2.0.weight']).float()
+        fc2_bias = torch.from_numpy(self.weights['dfsmn.fc2.0.bias']).float()
+        x = torch.matmul(x, fc2_weight.T) + fc2_bias
+        x = torch.relu(x)
+        # DEBUG: print(f"After FC2: {x.shape}")
+        
+        # Layer 3: FSMN1 (lookback/lookahead filters) - operates on 128-dim
+        x = self._apply_fsmn_layer(
+            x,
+            'dfsmn.fsmn1.lookback_filter.weight',
+            'dfsmn.fsmn1.lookahead_filter.weight'
         )
+        
+        # Layers 4-10: FSMN blocks 0-6 (each operates on 128-dim input/output)
+        for i in range(7):
+            x = self._apply_fsmn_block(x, i)
+        
+        # Layer 11: DNN layer
+        dnn_weight = torch.from_numpy(self.weights['dfsmn.dnns.0.weight']).float()
+        dnn_bias = torch.from_numpy(self.weights['dfsmn.dnns.0.bias']).float()
+        x = torch.matmul(x, dnn_weight.T) + dnn_bias
+        x = torch.relu(x)
+        
+        # Layer 12: Output layer
+        out_weight = torch.from_numpy(self.weights['out.weight']).float()
+        out_bias = torch.from_numpy(self.weights['out.bias']).float()
+        x = torch.matmul(x, out_weight.T) + out_bias
+        x = torch.sigmoid(x)
+        
+        return x.numpy()
+    
+    def _apply_fsmn_layer(
+        self,
+        x: torch.Tensor,
+        lookback_key: str,
+        lookahead_key: str
+    ) -> torch.Tensor:
+        """
+        Apply FSMN (Feed-Forward Sequential Memory Network) layer
+        
+        FSMN uses 1D convolutions with lookback and lookahead filters
+        to model temporal dependencies without recurrence.
+        
+        Args:
+            x: Input tensor (n_frames, hidden_dim)
+            lookback_key: Lookback filter weight key
+            lookahead_key: Lookahead filter weight key (may not exist for streaming)
+            
+        Returns:
+            Output tensor (n_frames, hidden_dim)
+        """
+        n_frames, input_dim = x.shape
+        
+        # Load filters - shape is (hidden_dim, 1, filter_order)
+        lookback_filter = torch.from_numpy(self.weights[lookback_key]).float()
+        
+        # Extract dimensions from filter shape
+        filter_hidden_dim = lookback_filter.shape[0]
+        lookback_order = lookback_filter.shape[-1]
+        
+        # Reshape filter to (hidden_dim, 1, filter_order) if needed
+        if lookback_filter.dim() == 3:
+            lookback_filter = lookback_filter.squeeze(1)  # (hidden_dim, filter_order)
+        
+        # Reshape input: (n_frames, hidden_dim) → (1, hidden_dim, n_frames)
+        x_conv = x.T.unsqueeze(0)  # (1, input_dim, n_frames)
+        
+        # Pad for lookback (pad left side - past context)
+        x_padded = torch.nn.functional.pad(x_conv, (lookback_order - 1, 0), mode='constant', value=0)
+        
+        # Apply lookback convolution (grouped conv1d)
+        lookback_out = torch.nn.functional.conv1d(
+            x_padded,
+            lookback_filter.unsqueeze(1),  # (hidden_dim, 1, filter_order)
+            groups=filter_hidden_dim
+        ).squeeze(0).T  # (n_frames, hidden_dim)
+        
+        # Lookahead filter (if exists - not for streaming models)
+        if lookahead_key in self.weights:
+            lookahead_filter = torch.from_numpy(self.weights[lookahead_key]).float()
+            lookahead_order = lookahead_filter.shape[-1]
+            
+            # Reshape filter
+            if lookahead_filter.dim() == 3:
+                lookahead_filter = lookahead_filter.squeeze(1)
+            
+            # Pad for lookahead (pad right side - future context)
+            x_padded_ahead = torch.nn.functional.pad(
+                x_conv,
+                (0, lookahead_order - 1),
+                mode='constant',
+                value=0
+            )
+            
+            # Apply lookahead convolution (reverse filter)
+            lookahead_out = torch.nn.functional.conv1d(
+                x_padded_ahead,
+                lookahead_filter.flip(dims=[-1]).unsqueeze(1),
+                groups=filter_hidden_dim
+            ).squeeze(0).T  # (n_frames, hidden_dim)
+            
+            # Combine lookback + lookahead + input (residual)
+            output = x + lookback_out + lookahead_out
+        else:
+            # Streaming mode: only lookback + input (residual)
+            output = x + lookback_out
+        
+        return output
+    
+    def _apply_fsmn_block(self, x: torch.Tensor, block_idx: int) -> torch.Tensor:
+        """
+        Apply one FSMN block
+        
+        Architecture per block:
+        - FC1: (128 → 256) with ReLU (expansion)
+        - FC2: (256 → 128) linear (contraction)
+        - FSMN: Lookback/lookahead filters on 128-dim
+        - Residual: Add input to output
+        
+        Args:
+            x: Input tensor (n_frames, 128)
+            block_idx: Block index (0-6)
+            
+        Returns:
+            Output tensor (n_frames, 128)
+        """
+        residual = x
+        
+        # FC1: (128 → 256) with ReLU
+        fc1_weight = torch.from_numpy(self.weights[f'dfsmn.fsmns.{block_idx}.fc1.0.weight']).float()
+        fc1_bias = torch.from_numpy(self.weights[f'dfsmn.fsmns.{block_idx}.fc1.0.bias']).float()
+        x = torch.matmul(x, fc1_weight.T) + fc1_bias
+        x = torch.relu(x)
+        
+        # FC2: (256 → 128) linear
+        fc2_weight = torch.from_numpy(self.weights[f'dfsmn.fsmns.{block_idx}.fc2.weight']).float()
+        x = torch.matmul(x, fc2_weight.T)
+        
+        # FSMN: Lookback/lookahead filters on 128-dim
+        lookback_key = f'dfsmn.fsmns.{block_idx}.fsmn.lookback_filter.weight'
+        lookahead_key = f'dfsmn.fsmns.{block_idx}.fsmn.lookahead_filter.weight'
+        x = self._apply_fsmn_layer(x, lookback_key, lookahead_key)
+        
+        # Residual connection
+        x = x + residual
+        
+        return x
     
     def predict(self, audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
         """
@@ -216,11 +378,11 @@ def test_feature_extraction():
         sys.exit(1)
     
     audio_path = Path(sys.argv[1])
-    pth_dir = Path("../../pth_models").resolve()
+    pth_dir = Path("../../models_pth").resolve()
     
-    # Fix path - pth_models is in firered-vad root
+    # Fix path - models_pth is in firered-vad root
     if not pth_dir.exists():
-        pth_dir = Path(__file__).parent.parent.parent / "pth_models"
+        pth_dir = Path(__file__).parent.parent.parent / "models_pth"
     
     print(f"Testing feature extraction on: {audio_path}")
     print()
@@ -286,13 +448,36 @@ def test_feature_extraction():
         print(f"  Std: {normalized.std():.6f}")
         print()
         
-        print("✓ Feature extraction working!")
+        print("[OK] Feature extraction working!")
         print()
-        print("NOTE: Full inference requires DFSMN architecture implementation.")
-        print("This would need to be ported from FireRedTeam's original code.")
+        
+        # Test full inference
+        print("Testing full DFSMN inference...")
+        try:
+            predictions = model.predict(audio, sample_rate)
+            
+            print(f"Inference complete:")
+            print(f"  Output shape: {predictions.shape}")
+            print(f"  Predictions: {predictions.shape[0]} frames x {predictions.shape[1]} classes")
+            print(f"  Range: [{predictions.min():.6f}, {predictions.max():.6f}]")
+            print(f"  Mean: {predictions.mean():.6f}")
+            print()
+            
+            # Show first/last few predictions
+            print("Sample predictions (first 10 frames):")
+            for i in range(min(10, predictions.shape[0])):
+                print(f"  Frame {i:4d}: {predictions[i]}")
+            
+            print()
+            print("[OK] Full DFSMN inference working!")
+            
+        except Exception as e:
+            print(f"[ERROR] Inference failed: {e}")
+            import traceback
+            traceback.print_exc()
         
     except Exception as e:
-        print(f"✗ Error: {e}")
+        print(f"[ERROR]: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

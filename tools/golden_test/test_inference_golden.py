@@ -233,9 +233,9 @@ def main():
     
     # Default directories
     if args.pth_dir is None:
-        args.pth_dir = Path(__file__).parent.parent.parent / "pth_models"
+        args.pth_dir = Path(__file__).parent.parent.parent / "models_pth"
     if args.gguf_dir is None:
-        args.gguf_dir = Path(__file__).parent.parent.parent / "gguf_models"
+        args.gguf_dir = Path(__file__).parent.parent.parent / "models_gguf"
     
     # Verify audio file exists
     if not args.audio.exists():

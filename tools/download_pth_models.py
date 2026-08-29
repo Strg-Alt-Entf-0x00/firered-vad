@@ -23,7 +23,7 @@ import hashlib
 HUGGINGFACE_REPO = "FireRedTeam/FireRedVAD"
 BASE_URL = f"https://huggingface.co/{HUGGINGFACE_REPO}/resolve/main"
 # Default output directory relative to project root (one level up from tools/)
-DEFAULT_OUTPUT_DIR = "../pth_models"
+DEFAULT_OUTPUT_DIR = "../models_pth"
 
 # Available models with metadata
 MODELS = {
@@ -366,7 +366,7 @@ After downloading, use convert_all_models.bat to convert PTH to GGUF format.
         '--output', '-o',
         type=str,
         default=DEFAULT_OUTPUT_DIR,
-        help=f'Output directory for models (default: pth_models in project root)'
+        help=f'Output directory for models (default: models_pth in project root)'
     )
     
     parser.add_argument(

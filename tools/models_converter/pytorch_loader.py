@@ -140,6 +140,15 @@ class PyTorchModelLoader:
         """
         Load CMVN (Cepstral Mean and Variance Normalization) statistics
         
+        CMVN statistics are stored in Kaldi binary .ark format:
+        - Header: '\x00BDM ' (5 bytes)
+        - Format info: 4 bytes  
+        - Dimension marker + size (e.g., '\x04Q\x00\x00\x00' for 81-dim)
+        - Float data: mean and variance vectors
+        
+        FireRed-VAD stores 81 dimensions (80 Fbank + 1 for frame count)
+        We extract the first 80 dimensions for mean and variance.
+        
         Returns:
             Tuple of (mean, variance) arrays, shape (80,)
             
@@ -152,36 +161,68 @@ class PyTorchModelLoader:
             
             print(f"  CMVN file size: {len(content)} bytes")
             
-            # Kaldi binary format has specific headers
-            # For now, we'll use a simplified parser
-            # Real Kaldi format is complex, but FireRed CMVN is simple
+            # Parse Kaldi binary format
+            offset = 0
             
-            # Try to parse as simple binary floats
-            # Expected: 2 vectors of 80 floats each = 160 floats = 640 bytes
-            if len(content) >= 640:
-                # Skip header bytes (Kaldi specific)
-                offset = len(content) - 640
-                floats = struct.unpack(f'<{160}f', content[offset:offset+640])
-                
-                mean = np.array(floats[:80], dtype=np.float32)
-                variance = np.array(floats[80:160], dtype=np.float32)
-                
-                # Validate
-                if not np.all(np.isfinite(mean)):
-                    raise RuntimeError("CMVN mean contains invalid values")
-                if not np.all(np.isfinite(variance)):
-                    raise RuntimeError("CMVN variance contains invalid values")
-                if not np.all(variance > 0):
-                    raise RuntimeError("CMVN variance contains non-positive values")
-                
-                print(f"  CMVN mean range: [{mean.min():.3f}, {mean.max():.3f}]")
-                print(f"  CMVN variance range: [{variance.min():.3f}, {variance.max():.3f}]")
-                
-                return mean, variance
-            else:
-                # Fallback: use default normalization
-                print(f"  Warning: CMVN file too small, using defaults")
-                return np.zeros(80, dtype=np.float32), np.ones(80, dtype=np.float32)
+            # Check header: '\x00BDM '
+            if content[offset:offset+5] != b'\x00BDM ':
+                raise RuntimeError(f"Invalid Kaldi header: {content[offset:offset+5]}")
+            offset += 5
+            
+            # Skip format info (5 bytes: \x04\x02\x00\x00\x00)
+            offset += 5
+            
+            # Read dimension marker and size
+            # Format: '\x04' (marker) + 4-byte little-endian uint32
+            if content[offset] != 0x04:
+                raise RuntimeError(f"Expected dimension marker 0x04, got {content[offset]:02x}")
+            offset += 1
+            
+            dim = struct.unpack('<I', content[offset:offset+4])[0]
+            offset += 4
+            print(f"  CMVN dimensions: {dim}")
+            
+            if dim != 81:
+                print(f"  Warning: Expected 81 dimensions, got {dim}")
+            
+            # Read float data (mean vector)
+            mean_size = dim * 4  # 4 bytes per float32
+            mean_data = struct.unpack(f'<{dim}f', content[offset:offset+mean_size])
+            mean = np.array(mean_data[:80], dtype=np.float32)  # Take first 80
+            offset += mean_size
+            
+            # Read dimension marker again for variance
+            if content[offset] != 0x04:
+                raise RuntimeError(f"Expected dimension marker 0x04 for variance, got {content[offset]:02x}")
+            offset += 1
+            
+            var_dim = struct.unpack('<I', content[offset:offset+4])[0]
+            offset += 4
+            
+            if var_dim != dim:
+                raise RuntimeError(f"Variance dimension mismatch: {var_dim} != {dim}")
+            
+            # Read float data (variance vector)
+            var_size = var_dim * 4
+            var_data = struct.unpack(f'<{var_dim}f', content[offset:offset+var_size])
+            variance = np.array(var_data[:80], dtype=np.float32)  # Take first 80
+            offset += var_size
+            
+            # Validate
+            if not np.all(np.isfinite(mean)):
+                raise RuntimeError("CMVN mean contains invalid values (NaN/Inf)")
+            if not np.all(np.isfinite(variance)):
+                raise RuntimeError("CMVN variance contains invalid values (NaN/Inf)")
+            if not np.all(variance > 0):
+                # Find which values are bad
+                bad_indices = np.where(variance <= 0)[0]
+                raise RuntimeError(f"CMVN variance contains non-positive values at indices: {bad_indices}")
+            
+            print(f"  CMVN mean range: [{mean.min():.3f}, {mean.max():.3f}]")
+            print(f"  CMVN variance range: [{variance.min():.3f}, {variance.max():.3f}]")
+            print(f"  [OK] CMVN loaded successfully")
+            
+            return mean, variance
                 
         except Exception as e:
             print(f"  Warning: CMVN parsing failed ({e}), using defaults")
@@ -210,12 +251,12 @@ def test_loader():
         
         print("Loading model weights...")
         weights = loader.load()
-        print(f"✓ Loaded {len(weights)} tensors")
+        print(f"[OK] Loaded {len(weights)} tensors")
         print()
         
         print("Loading CMVN statistics...")
         mean, variance = loader.load_cmvn()
-        print(f"✓ CMVN shapes: mean={mean.shape}, variance={variance.shape}")
+        print(f"[OK] CMVN shapes: mean={mean.shape}, variance={variance.shape}")
         print()
         
         print("SUCCESS: All loading tests passed!")

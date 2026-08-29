@@ -3,7 +3,7 @@
 import struct
 from pathlib import Path
 
-cmvn_path = Path("../pth_models/vad/cmvn.ark")
+cmvn_path = Path("../models_pth/vad/cmvn.ark")
 content = cmvn_path.read_bytes()
 
 print(f"File size: {len(content)} bytes")

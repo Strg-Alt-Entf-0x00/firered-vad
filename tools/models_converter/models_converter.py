@@ -327,14 +327,14 @@ def main():
     parser.add_argument(
         '--input-dir',
         type=str,
-        default='../pth_models',
+        default='../models_pth',
         help='PTH models directory'
     )
     
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='../gguf_models',
+        default='../models_gguf',
         help='GGUF output directory'
     )
     

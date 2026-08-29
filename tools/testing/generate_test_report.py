@@ -242,7 +242,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Generate Test Report")
-    parser.add_argument('--dir', '-d', type=str, default='../gguf_models',
+    parser.add_argument('--dir', '-d', type=str, default='../models_gguf',
                        help='Directory with GGUF and debug JSON files')
     parser.add_argument('--output', '-o', type=str, default='../TEST_REPORT.md',
                        help='Output markdown file')

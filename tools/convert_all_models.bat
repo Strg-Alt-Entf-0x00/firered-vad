@@ -42,7 +42,7 @@ echo Python script: %PYTHON_SCRIPT%
 echo.
 
 REM Check if PTH models exist
-set "PTH_DIR=%SCRIPT_DIR%..\pth_models"
+set "PTH_DIR=%SCRIPT_DIR%..\models_pth"
 if not exist "%PTH_DIR%" (
     echo [WARNING] PTH models directory not found: %PTH_DIR%
     echo.

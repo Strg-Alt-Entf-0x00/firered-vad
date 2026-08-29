@@ -472,7 +472,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="GGUF Model Loader and Validator")
     parser.add_argument('--input', '-i', type=str, help='Single GGUF file to test')
-    parser.add_argument('--dir', '-d', type=str, default='../gguf_models', help='Directory with GGUF files')
+    parser.add_argument('--dir', '-d', type=str, default='../models_gguf', help='Directory with GGUF files')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     args = parser.parse_args()

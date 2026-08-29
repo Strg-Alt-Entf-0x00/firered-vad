@@ -198,7 +198,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Compare Quantization Quality")
-    parser.add_argument('--dir', '-d', type=str, default='../gguf_models',
+    parser.add_argument('--dir', '-d', type=str, default='../models_gguf',
                        help='Directory with debug JSON files')
     parser.add_argument('--model', '-m', type=str,
                        choices=['vad', 'stream-vad', 'aed-vad'],
