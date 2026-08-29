@@ -27,22 +27,24 @@ def normalize_excludes(excludes: List[str]) -> List[str]:
 
 def is_excluded(abs_path: str, project_root: str, excludes: List[str]) -> bool:
     rel = os.path.relpath(abs_path, project_root)
-    rel = rel.replace('\\', '/').replace('\\', '/')
+    rel = rel.replace('\\', '/')
     
     # Exclude directories starting with dot (e.g., .git, .docs, .vscode)
     # Only check directory names, not the final filename
+    # Special case: '.' is the current directory, NOT a dot-prefixed directory
     path_parts = rel.split('/')
+    
     # Check all parts except the last one (which might be a file)
-    for i, part in enumerate(path_parts[:-1]):  # Don't check the last part (filename)
-        if part.startswith('.'):
+    for part in path_parts[:-1]:
+        if part.startswith('.') and part != '.':
             return True
     
-    # Also check if the path itself is a directory and starts with dot
-    if os.path.isdir(abs_path) and path_parts and path_parts[-1].startswith('.'):
+    # Also check if the path itself is a directory and starts with dot (but not '.')
+    if os.path.isdir(abs_path) and path_parts and path_parts[-1].startswith('.') and path_parts[-1] != '.':
         return True
     
     for ex in excludes:
-        ex_norm = ex.replace('\\', '/').replace('\\', '/').rstrip('/')
+        ex_norm = ex.replace('\\', '/').rstrip('/')
         if rel == ex_norm or rel.startswith(ex_norm + '/'):
             return True
     return False
@@ -56,10 +58,13 @@ def is_file_excluded(filename: str, file_excludes: List[str]) -> bool:
     return False
 
 
-def make_zip(project_root: str, dest_zip: str, excludes: List[str], file_excludes: List[str]) -> str:
+def make_zip(project_root: str, dest_zip: str, excludes: List[str], file_excludes: List[str], verbose: bool = False) -> str:
+    file_count = 0
     with zipfile.ZipFile(dest_zip, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(project_root):
             if is_excluded(root, project_root, excludes):
+                if verbose:
+                    print(f'[EXCLUDE DIR] {os.path.relpath(root, project_root)}')
                 dirs[:] = []
                 continue
             rel_root = os.path.relpath(root, project_root)
@@ -67,12 +72,18 @@ def make_zip(project_root: str, dest_zip: str, excludes: List[str], file_exclude
                 rel_root = ''
             for f in files:
                 if is_file_excluded(f, file_excludes):
+                    if verbose:
+                        print(f'[EXCLUDE FILE] {os.path.join(rel_root, f)}')
                     continue
                 absf = os.path.join(root, f)
                 if os.path.abspath(absf) == os.path.abspath(dest_zip):
                     continue
                 arcname = os.path.normpath(os.path.join(rel_root, f))
                 zf.write(absf, arcname)
+                file_count += 1
+                if verbose:
+                    print(f'[INCLUDE] {arcname}')
+    print(f'Total files added to backup: {file_count}')
     return dest_zip
 
 
@@ -82,6 +93,7 @@ def main() -> int:
     parser.add_argument('--archive-root', help='Central archive root (overrides auto-detection).', default=None)
     parser.add_argument('--exclude', action='append', help='Relative paths to exclude (can be provided multiple times).', default=[])
     parser.add_argument('--dry-run', action='store_true', help='Show what would be done without creating files.')
+    parser.add_argument('--verbose', action='store_true', help='Show detailed information about included/excluded files.')
     args = parser.parse_args()
 
     script_path = __file__
@@ -149,7 +161,7 @@ def main() -> int:
         print('Dry run: no files will be created.')
         return 0
 
-    make_zip(project_root, project_zip_path, excludes, default_file_excludes)
+    make_zip(project_root, project_zip_path, excludes, default_file_excludes, verbose=args.verbose)
 
     print('Backup completed.')
     print(f'- Local: {project_zip_path}')
