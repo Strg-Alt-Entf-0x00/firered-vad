@@ -187,32 +187,27 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    std::cout << "✓ Frame detection complete\n";
-    std::cout << "  Frames: " << frame_probs.size() << "\n";
-    
-    // Calculate statistics
-    float min_prob = 1.0f, max_prob = 0.0f, sum_prob = 0.0f;
-    int speech_frames = 0;
-    
-    for (float prob : frame_probs) {
-        if (prob < min_prob) min_prob = prob;
-        if (prob > max_prob) max_prob = prob;
-        sum_prob += prob;
-        if (prob > 0.5f) speech_frames++;
-    }
-    
-    float mean_prob = sum_prob / frame_probs.size();
-    
-    std::cout << "  Min probability: " << min_prob << "\n";
-    std::cout << "  Max probability: " << max_prob << "\n";
-    std::cout << "  Mean probability: " << mean_prob << "\n";
-    std::cout << "  Speech frames (>0.5): " << speech_frames << " / " << frame_probs.size() 
-              << " (" << (100.0f * speech_frames / frame_probs.size()) << "%)\n\n";
-    
-    // Show first 10 frame probabilities
     std::cout << "First 10 frame probabilities:\n";
     for (size_t i = 0; i < std::min(size_t(10), frame_probs.size()); i++) {
         std::cout << "  Frame " << i << ": " << frame_probs[i] << "\n";
+    }
+    
+    // Run advanced post-processing (state machine, smoothing, merging)
+    std::cout << "\nRunning Advanced Post-Processing..." << std::endl;
+    fireredVADPostProcessConfig post_config;
+    auto segments = firered_vad_postprocess(frame_probs, post_config);
+    
+    std::cout << "✓ Post-Processing complete\n";
+    std::cout << "  Found " << segments.size() << " speech segments:\n";
+    
+    for (size_t i = 0; i < segments.size(); ++i) {
+        float start_time = segments[i].start_time;
+        float end_time = segments[i].end_time;
+        float duration = end_time - start_time;
+        
+        std::cout << "  [" << (i+1) << "] " 
+                  << start_time << "s -> " << end_time << "s "
+                  << "(duration: " << duration << "s)\n";
     }
     
     std::cout << "\n========================================\n";

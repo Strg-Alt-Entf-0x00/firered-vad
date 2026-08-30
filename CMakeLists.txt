@@ -55,6 +55,7 @@ endif()
 set(firered_vad_SOURCES
     src/firered_vad.cpp
     src/firered_fbank.cpp
+    src/firered_postprocess.cpp
 )
 
 set(firered_vad_HEADERS

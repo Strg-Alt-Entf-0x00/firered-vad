@@ -43,6 +43,23 @@ struct fireredAEDResult {
     }
 };
 
+/// @brief Configuration for VAD Post-Processing
+struct fireredVADPostProcessConfig {
+    int smooth_window_size = 5;
+    float prob_threshold = 0.4f;
+    int min_speech_frame = 20;
+    int max_speech_frame = 2000;
+    int min_silence_frame = 20;
+    int merge_silence_frame = 0;
+    int extend_speech_frame = 0;
+};
+
+/// @brief Segment representing a speech region
+struct fireredVADSegment {
+    float start_time;
+    float end_time;
+};
+
 /// @brief Configuration for firered VAD
 struct fireredVADConfig {
     int sample_rate_hz = 16000;       ///< Input sample rate (16kHz required)
@@ -51,7 +68,9 @@ struct fireredVADConfig {
     float threshold = 0.5f;           ///< Speech probability threshold
     int n_threads = 4;                ///< Number of threads for inference
     bool use_gpu = false;             ///< Use CUDA if available
+    bool enable_cache = true;         ///< Enable stateful cache (auto-detected: true for stream, false for offline)
     fireredVADMode mode = fireredVADMode::Standard;  ///< Operating mode (auto-detected from model if not set)
+    fireredVADPostProcessConfig post_process; ///< Configuration for VAD post-processing
 };
 
 /// @brief Initialize firered VAD from GGUF model
@@ -159,10 +178,13 @@ fireredAEDResult firered_aed_detect(
 
 /// @brief Reset state (for new audio stream)
 ///
-/// DFSMN is stateless, so this is a no-op. Kept for API compatibility
-/// in case future models require state management.
+/// Clears the internal FSMN caches if streaming mode is enabled.
 ///
 /// @param ctx firered context
+void firered_vad_reset_cache(fireredVADContext* ctx);
+
+/// @brief Reset state (for new audio stream) - DEPRECATED
+/// Use firered_vad_reset_cache instead.
 void firered_vad_reset(fireredVADContext* ctx);
 
 /// @brief Apply speech/silence segmentation with hysteresis
@@ -178,6 +200,15 @@ std::vector<std::pair<int, int>> firered_vad_segment(
     float offset_threshold = 0.3f,
     int min_speech_frames = 10,
     int min_silence_frames = 5
+);
+
+/// @brief Apply advanced VAD post-processing (smoothing, state machine, merging)
+/// @param probs Raw frame-level probabilities (e.g., from firered_vad_detect_frames)
+/// @param config Configuration for post-processing
+/// @return Vector of speech segments with start and end times in seconds
+std::vector<fireredVADSegment> firered_vad_postprocess(
+    const std::vector<float>& probs,
+    const fireredVADPostProcessConfig& config = fireredVADPostProcessConfig()
 );
 
 /// @brief Get model metadata (version, language, training info)
@@ -246,7 +277,13 @@ public:
     /// @brief Detect audio events frame-by-frame (AED mode only)
     std::vector<fireredAEDResult> detect_aed_frames(const std::vector<float>& audio, int sample_rate_hz = 16000);
 
-    /// @brief Reset state for new audio stream (no-op for DFSMN)
+    /// @brief Apply advanced VAD post-processing to raw probabilities
+    std::vector<fireredVADSegment> postprocess(const std::vector<float>& probs);
+
+    /// @brief Reset FSMN caches for new audio stream
+    void reset_cache();
+
+    /// @brief Reset state for new audio stream (DEPRECATED)
     void reset();
 
     /// @brief Get current operating mode

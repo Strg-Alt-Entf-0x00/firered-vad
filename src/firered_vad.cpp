@@ -110,6 +110,10 @@ struct fireredVADContext {
     std::vector<float> cmvn_mean;
     std::vector<float> cmvn_std;
     
+    // Stateful Streaming Cache
+    // Shape: [num_fsmn_layers][lookback_padding * projection_dim]
+    std::vector<std::vector<float>> fsmn_caches;
+    
     // RAII destructor for safe memory management
     ~fireredVADContext() {
         if (fbank_extractor) {
@@ -501,10 +505,13 @@ static std::vector<float> preprocess_audio(
 // Helper: Apply FSMN layer (Feed-Forward Sequential Memory Network)
 // FSMN uses 1D grouped convolutions for temporal modeling
 static struct ggml_tensor* apply_fsmn_layer(
+    fireredVADContext* ctx,
     ggml_context* ctx_compute,
     struct ggml_tensor* input,  // Shape: (n_frames, hidden_dim)
     struct ggml_tensor* lookback_filter,   // Shape: (hidden_dim, 1, lookback_order)
-    struct ggml_tensor* lookahead_filter   // Shape: (hidden_dim, 1, lookahead_order) or nullptr
+    struct ggml_tensor* lookahead_filter,  // Shape: (hidden_dim, 1, lookahead_order) or nullptr
+    std::vector<struct ggml_tensor*>& cache_in_tensors,
+    std::vector<struct ggml_tensor*>& cache_out_tensors
 ) {
     int n_frames = static_cast<int>(input->ne[1]);
     int hidden_dim = static_cast<int>(input->ne[0]);
@@ -521,9 +528,23 @@ static struct ggml_tensor* apply_fsmn_layer(
     
     // Apply lookback convolution (grouped conv1d)
     int lookback_order = static_cast<int>(lookback_filter->ne[0]);
+    int lookback_padding = lookback_order - 1;
+    
+    // Save x_reshaped for extracting the cache after execution
+    if (ctx->config.enable_cache) {
+        ggml_set_output(x_reshaped);
+        cache_out_tensors.push_back(x_reshaped);
+    }
     
     // Pad left for lookback (past context) on ne[0]
-    struct ggml_tensor* x_padded = ggml_pad_ext(ctx_compute, x_reshaped, lookback_order - 1, 0, 0, 0, 0, 0, 0, 0);
+    struct ggml_tensor* x_padded = ggml_pad_ext(ctx_compute, x_reshaped, lookback_padding, 0, 0, 0, 0, 0, 0, 0);
+    
+    if (ctx->config.enable_cache) {
+        struct ggml_tensor* cache_in = ggml_new_tensor_3d(ctx_compute, GGML_TYPE_F32, n_frames + lookback_padding, hidden_dim, 1);
+        ggml_set_input(cache_in);
+        cache_in_tensors.push_back(cache_in);
+        x_padded = ggml_add(ctx_compute, x_padded, cache_in);
+    }
     
     // Grouped 1D convolution for lookback
     // GGML conv_1d_dw parameters: (ctx, kernel, input, stride, padding, dilation)
@@ -556,12 +577,14 @@ static struct ggml_tensor* apply_fsmn_layer(
     return result;
 }
 
-// Helper: Apply one FSMN block
 // Helper: Apply FSMN block (FC1 → FC2 → FSMN → Residual)
 static struct ggml_tensor* apply_fsmn_block(
+    fireredVADContext* ctx,
     ggml_context* ctx_compute,
     struct ggml_tensor* input,  // Shape: (n_frames, 128)
-    const decltype(fireredVADContext::model)::FSMNBlock& block
+    const decltype(fireredVADContext::model)::FSMNBlock& block,
+    std::vector<struct ggml_tensor*>& cache_in_tensors,
+    std::vector<struct ggml_tensor*>& cache_out_tensors
 ) {
     // Save for residual connection
     struct ggml_tensor* residual = input;
@@ -575,7 +598,7 @@ static struct ggml_tensor* apply_fsmn_block(
     
     block_x = ggml_mul_mat(ctx_compute, block.fc2_weight, block_x);
     
-    block_x = apply_fsmn_layer(ctx_compute, block_x, block.lookback_filter, block.lookahead_filter);
+    block_x = apply_fsmn_layer(ctx, ctx_compute, block_x, block.lookback_filter, block.lookahead_filter, cache_in_tensors, cache_out_tensors);
     
     // Add residual connection
     struct ggml_tensor* x = ggml_add(ctx_compute, residual, block_x);
@@ -609,6 +632,15 @@ static float run_firered_inference(
     
     // ---- Build DFSMN forward pass compute graph ----
     
+    std::vector<struct ggml_tensor*> cache_in_tensors;
+    std::vector<struct ggml_tensor*> cache_out_tensors;
+    
+    // Initialize caches if enabled and not already initialized
+    if (ctx->config.enable_cache && ctx->fsmn_caches.empty()) {
+        int lookback_padding = ctx->lookback_order - 1;
+        ctx->fsmn_caches.resize(8, std::vector<float>(lookback_padding * ctx->hidden_dim, 0.0f));
+    }
+    
     // 1. Input tensor: (feature_dim, n_frames) in ggml column-major
     struct ggml_tensor* inp = ggml_new_tensor_2d(ctx_compute, GGML_TYPE_F32, ctx->feature_dim, n_frames);
     ggml_set_input(inp);
@@ -629,12 +661,12 @@ static float run_firered_inference(
     ggml_set_name(x, "fc2_out");
     
     // 4. FSMN1: Initial memory layer
-    x = apply_fsmn_layer(ctx_compute, x, ctx->model.fsmn1_lookback, ctx->model.fsmn1_lookahead);
+    x = apply_fsmn_layer(ctx, ctx_compute, x, ctx->model.fsmn1_lookback, ctx->model.fsmn1_lookahead, cache_in_tensors, cache_out_tensors);
     ggml_set_name(x, "fsmn1_out");
     
     // 5. FSMN blocks 0-6: Each with FC1, FC2, FSMN, residual
     for (int i = 0; i < 7; i++) {
-        x = apply_fsmn_block(ctx_compute, x, ctx->model.fsmn_blocks[i]);
+        x = apply_fsmn_block(ctx, ctx_compute, x, ctx->model.fsmn_blocks[i], cache_in_tensors, cache_out_tensors);
         ggml_set_name(x, ("fsmn_block_" + std::to_string(i)).c_str());
     }
     
@@ -679,12 +711,77 @@ static float run_firered_inference(
         ggml_backend_tensor_set(inp, features, 0, n_frames * ctx->feature_dim * sizeof(float));
     }
     
+    // If cache is enabled, populate the cache_in_tensors with data from ctx->fsmn_caches
+    if (ctx->config.enable_cache && cache_in_tensors.size() == ctx->fsmn_caches.size()) {
+        int lookback_padding = ctx->lookback_order - 1;
+        for (size_t i = 0; i < cache_in_tensors.size(); i++) {
+            // cache_in_tensors[i] has shape [n_frames + lookback_padding, hidden_dim, 1]
+            // We only need to write the first lookback_padding frames (time dimension is ne[0] or ne[1] depending on permutation)
+            // Wait, cache_in was created as: [n_frames + lookback_padding, hidden_dim, 1]
+            // But we only want to fill the first lookback_padding elements along the time axis.
+            // Actually, cache_in is zero-initialized by ggml? No, ggml_new_tensor does not zero-initialize!
+            // We must create a CPU buffer of size (n_frames + lookback_padding) * hidden_dim, fill first part with cache, rest with zero.
+            std::vector<float> padded_cache((n_frames + lookback_padding) * ctx->hidden_dim, 0.0f);
+            
+            // The FSMN layer applies ggml_add(x_padded, cache_in).
+            // x_padded has shape [n_frames + lookback_padding, hidden_dim, 1].
+            // ne[0] is time (n_frames + lookback_padding), ne[1] is hidden_dim.
+            // So memory layout is column-major: contiguous in time for each hidden dimension!
+            // Wait, ggml_permute was 1, 0, 2, 3 -> so ne[0] = n_frames, ne[1] = hidden.
+            // This means for a fixed hidden_dim (row), the time elements are contiguous.
+            // So padded_cache should have the cache elements at the start of each row.
+            
+            for (int h = 0; h < ctx->hidden_dim; h++) {
+                for (int t = 0; t < lookback_padding; t++) {
+                    padded_cache[h * (n_frames + lookback_padding) + t] = ctx->fsmn_caches[i][h * lookback_padding + t];
+                }
+            }
+            ggml_backend_tensor_set(cache_in_tensors[i], padded_cache.data(), 0, padded_cache.size() * sizeof(float));
+        }
+    }
+    
     // Execute compute graph on backend
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         set_error("Failed to compute DFSMN inference graph");
         ggml_gallocr_free(allocr);
         ggml_free(ctx_compute);
         return 0.0f;
+    }
+    
+    // Extract new cache states for the next chunk
+    if (ctx->config.enable_cache && cache_out_tensors.size() == ctx->fsmn_caches.size()) {
+        int lookback_padding = ctx->lookback_order - 1;
+        for (size_t i = 0; i < cache_out_tensors.size(); i++) {
+            // cache_out_tensors[i] is x_reshaped of shape [n_frames, hidden_dim, 1].
+            // We want the LAST lookback_padding frames from each hidden dimension.
+            std::vector<float> out_buf(n_frames * ctx->hidden_dim);
+            ggml_backend_tensor_get(cache_out_tensors[i], out_buf.data(), 0, out_buf.size() * sizeof(float));
+            
+            // If n_frames < lookback_padding, we must shift the old cache and append the new frames!
+            // But if n_frames >= lookback_padding, we just take the last lookback_padding frames.
+            if (n_frames >= lookback_padding) {
+                for (int h = 0; h < ctx->hidden_dim; h++) {
+                    for (int t = 0; t < lookback_padding; t++) {
+                        int src_t = n_frames - lookback_padding + t;
+                        ctx->fsmn_caches[i][h * lookback_padding + t] = out_buf[h * n_frames + src_t];
+                    }
+                }
+            } else {
+                // Shift old cache left by n_frames, then append new frames
+                int shift = n_frames;
+                int keep = lookback_padding - shift;
+                for (int h = 0; h < ctx->hidden_dim; h++) {
+                    // Shift
+                    for (int t = 0; t < keep; t++) {
+                        ctx->fsmn_caches[i][h * lookback_padding + t] = ctx->fsmn_caches[i][h * lookback_padding + t + shift];
+                    }
+                    // Append
+                    for (int t = 0; t < shift; t++) {
+                        ctx->fsmn_caches[i][h * lookback_padding + keep + t] = out_buf[h * n_frames + t];
+                    }
+                }
+            }
+        }
     }
     
     // Read result based on mode
@@ -949,15 +1046,16 @@ bool firered_vad_detect_frames_aligned(
     return true;
 }
 
-void firered_vad_reset(fireredVADContext* ctx) {
-    if (!ctx) {
-        return;
+void firered_vad_reset_cache(fireredVADContext* ctx) {
+    if (!ctx) return;
+    for (auto& cache : ctx->fsmn_caches) {
+        std::fill(cache.begin(), cache.end(), 0.0f);
     }
-    
-    // DFSMN is stateless - no hidden state to reset
-    // This function is kept for API compatibility but does nothing
-    
-    std::cout << "[firered VAD] Reset called (DFSMN is stateless, no operation needed)" << std::endl;
+    std::cout << "[firered VAD] Cache reset (Streaming state cleared)" << std::endl;
+}
+
+void firered_vad_reset(fireredVADContext* ctx) {
+    firered_vad_reset_cache(ctx);
 }
 
 std::vector<std::pair<int, int>> firered_vad_segment(
@@ -1232,8 +1330,16 @@ std::vector<fireredAEDResult> fireredVAD::detect_aed_frames(const std::vector<fl
     return results;
 }
 
+void fireredVAD::reset_cache() {
+    firered_vad_reset_cache(ctx_);
+}
+
 void fireredVAD::reset() {
-    firered_vad_reset(ctx_);
+    firered_vad_reset_cache(ctx_);
+}
+
+std::vector<fireredVADSegment> fireredVAD::postprocess(const std::vector<float>& probs) {
+    return firered_vad_postprocess(probs, config_.post_process);
 }
 
 fireredVADMode fireredVAD::mode() const {
