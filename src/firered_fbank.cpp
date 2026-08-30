@@ -32,8 +32,6 @@ float FbankExtractor::MelToHz(float mel) noexcept {
 
 void FbankExtractor::InitMelBanks() {
     // Initialize mel filterbanks (triangular filters)
-    
-    int fft_bins = config_.num_fft_bins / 2 + 1;  // Only positive frequencies
     mel_banks_.resize(config_.num_mel_bins);
     
     // Convert frequency range to mel scale
@@ -82,7 +80,7 @@ void FbankExtractor::InitMelBanks() {
         twiddle_imag_.resize(num_fft_bins);
         
         for (int size = 2; size <= num_fft_bins; size *= 2) {
-            float tablestep = -2.0f * M_PI / size;
+            float tablestep = static_cast<float>(-2.0 * M_PI / size);
             for (int k = 0; k < size / 2; k++) {
                 float angle = k * tablestep;
                 // Store at index size/2 + k to avoid overlapping sizes
@@ -104,7 +102,7 @@ void FbankExtractor::InitWindow() {
     for (int i = 0; i < frame_length; i++) {
         // Hamming window: 0.54 - 0.46 * cos(2*pi*n/(N-1))
         window_[i] = 0.54f - 0.46f * std::cos(
-            2.0f * M_PI * i / (frame_length - 1)
+            static_cast<float>(2.0 * M_PI * i / (frame_length - 1))
         );
     }
 }
@@ -131,7 +129,7 @@ void FbankExtractor::ComputeFFT(
         for (int k = 0; k < num_bins; k++) {
             float real = 0.0f, imag = 0.0f;
             for (int n = 0; n < frame_length; n++) {
-                float angle = -2.0f * M_PI * k * n / fft_bins;
+                float angle = static_cast<float>(-2.0 * M_PI * k * n / fft_bins);
                 real += frame[n] * std::cos(angle);
                 imag += frame[n] * std::sin(angle);
             }
@@ -254,10 +252,10 @@ std::vector<float> FbankExtractor::ExtractFeatures(
         int start_sample = f * frame_shift;
         
         // Kaldi Fbank exact preprocessing pipeline
-        // 1. Copy frame (do NOT scale by 32768 because PyTorch model was trained on unscaled [-1, 1] features)
+        // 1. Copy frame and scale by 32768 (torchaudio.compliance.kaldi.fbank implicitly scales [-1, 1] inputs to 16-bit PCM range)
         for (int i = 0; i < frame_length; i++) {
             if (start_sample + i < num_samples) {
-                frame_buffer[i] = samples[start_sample + i]; // No * 32768.0f
+                frame_buffer[i] = samples[start_sample + i] * 32768.0f;
             } else {
                 frame_buffer[i] = 0.0f;
             }
@@ -285,8 +283,6 @@ std::vector<float> FbankExtractor::ExtractFeatures(
         
         // 4. Preemphasis (default 0.97)
         float preemph = 0.97f;
-        // Preemphasis needs the previous sample, which is from outside the current frame
-        float prev_sample = 0.0f;
         if (start_sample > 0) {
             // Need the raw sample from before this frame, scaled and dithered?
             // Kaldi applies preemphasis AFTER dc offset. The "previous sample" in Kaldi is the 

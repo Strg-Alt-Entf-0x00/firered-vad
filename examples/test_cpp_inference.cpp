@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
     // Test 3: Generate test audio (1 second white noise)
     std::cout << "\n[Test 3] Testing with white noise (1 second)...\n";
     
-    srand(time(nullptr));
+    srand(static_cast<unsigned int>(time(nullptr)));
     const int sample_rate = 16000;
     const int duration_sec = 1;
     const int n_samples = sample_rate * duration_sec;
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     const float frequency = 440.0f;  // A4 note
     for (int i = 0; i < n_samples; i++) {
         float t = i / float(sample_rate);
-        tone[i] = 0.5f * sin(2.0f * M_PI * frequency * t);
+        tone[i] = 0.5f * sin(static_cast<float>(2.0 * M_PI * frequency * t));
     }
     
     float tone_prob = firered_vad_detect(ctx, tone.data(), n_samples, sample_rate);

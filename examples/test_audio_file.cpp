@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
     
     // Run VAD detection (average probability)
     std::cout << "Running VAD detection (average)..." << std::endl;
-    float avg_prob = firered_vad_detect(ctx, audio.data(), audio.size(), sample_rate);
+    float avg_prob = firered_vad_detect(ctx, audio.data(), static_cast<int>(audio.size()), sample_rate);
     
     std::cout << "✓ Detection complete\n";
     std::cout << "  Average speech probability: " << avg_prob << "\n\n";
@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     // Run frame-level detection
     std::cout << "Running frame-level detection..." << std::endl;
     std::vector<float> frame_probs;
-    bool success = firered_vad_detect_frames(ctx, audio.data(), audio.size(), 
+    bool success = firered_vad_detect_frames(ctx, audio.data(), static_cast<int>(audio.size()), 
                                               sample_rate, frame_probs);
     
     if (!success) {

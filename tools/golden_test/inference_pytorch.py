@@ -56,7 +56,7 @@ class FireRedVADPyTorch:
             raise ValueError("Sample rate must be 16kHz")
         
         # Convert to torch tensor
-        waveform = torch.from_numpy(audio).float()
+        waveform = torch.from_numpy(audio).float() * 32768.0
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)  # Add channel dimension
         

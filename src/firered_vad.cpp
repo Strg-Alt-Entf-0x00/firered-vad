@@ -146,6 +146,11 @@ struct fireredVADContext {
             ggml_backend_free(backend);
             backend = nullptr;
         }
+        
+        if (allocr) {
+            ggml_gallocr_free(allocr);
+            allocr = nullptr;
+        }
     }
     
     // Delete copy semantics
@@ -154,6 +159,9 @@ struct fireredVADContext {
     
     // Allow default construction
     fireredVADContext() = default;
+    
+    // Graph allocator for zero-allocation inference
+    struct ggml_gallocr* allocr = nullptr;
 };
 
 // Helper: Detect mode from model filename
@@ -162,7 +170,7 @@ static fireredVADMode detect_mode_from_path(const char* model_path) {
     std::string filename = path_str.substr(path_str.find_last_of("/\\") + 1);
     
     // Convert to lowercase for comparison
-    std::transform(filename.begin(), filename.end(), filename.begin(), ::tolower);
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
     
     if (filename.find("stream") != std::string::npos) {
         std::cout << "[firered VAD] Auto-detected mode: Streaming" << std::endl;
@@ -239,7 +247,7 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
     
     key_idx = gguf_find_key(ctx->gguf_ctx, "firered.cmvn_mean");
     if (key_idx >= 0) {
-        int n_elements = gguf_get_arr_n(ctx->gguf_ctx, key_idx);
+        int n_elements = static_cast<int>(gguf_get_arr_n(ctx->gguf_ctx, key_idx));
         const float* data = (const float*)gguf_get_arr_data(ctx->gguf_ctx, key_idx);
         ctx->cmvn_mean.assign(data, data + n_elements);
         std::cout << "[firered VAD] Loaded CMVN mean (" << n_elements << " dims)" << std::endl;
@@ -247,7 +255,7 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
     
     key_idx = gguf_find_key(ctx->gguf_ctx, "firered.cmvn_variance");
     if (key_idx >= 0) {
-        int n_elements = gguf_get_arr_n(ctx->gguf_ctx, key_idx);
+        int n_elements = static_cast<int>(gguf_get_arr_n(ctx->gguf_ctx, key_idx));
         const float* data = (const float*)gguf_get_arr_data(ctx->gguf_ctx, key_idx);
         ctx->cmvn_std.resize(n_elements);
         for (int i = 0; i < n_elements; i++) {
@@ -420,27 +428,27 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
     
     // Detect model dimensions from tensors
     if (ctx->model.fc1_weight) {
-        ctx->feature_dim = ctx->model.fc1_weight->ne[0];  // Input dimension (80)
+        ctx->feature_dim = static_cast<int>(ctx->model.fc1_weight->ne[0]);  // Input dimension (80)
         std::cout << "[firered VAD] Feature dimension: " << ctx->feature_dim << std::endl;
     }
     
     if (ctx->model.fc2_weight) {
-        ctx->hidden_dim = ctx->model.fc2_weight->ne[1];  // Output dimension of FC2 (128)
+        ctx->hidden_dim = static_cast<int>(ctx->model.fc2_weight->ne[1]);  // Output dimension of FC2 (128)
         std::cout << "[firered VAD] Hidden dimension: " << ctx->hidden_dim << std::endl;
     }
     
     if (ctx->model.out_weight) {
-        ctx->n_classes = ctx->model.out_weight->ne[1];  // Number of output classes (1)
+        ctx->n_classes = static_cast<int>(ctx->model.out_weight->ne[1]);  // Number of output classes (1)
         std::cout << "[firered VAD] Output classes: " << ctx->n_classes << std::endl;
     }
     
     if (ctx->model.fsmn1_lookback) {
-        ctx->lookback_order = ctx->model.fsmn1_lookback->ne[0];  // Filter size
+        ctx->lookback_order = static_cast<int>(ctx->model.fsmn1_lookback->ne[0]);  // Filter size
         std::cout << "[firered VAD] Lookback order: " << ctx->lookback_order << std::endl;
     }
     
     if (ctx->model.fsmn1_lookahead) {
-        ctx->lookahead_order = ctx->model.fsmn1_lookahead->ne[0];  // Filter size
+        ctx->lookahead_order = static_cast<int>(ctx->model.fsmn1_lookahead->ne[0]);  // Filter size
         std::cout << "[firered VAD] Lookahead order: " << ctx->lookahead_order << std::endl;
     } else {
         ctx->lookahead_order = 0;  // Streaming mode
@@ -451,6 +459,9 @@ static bool load_gguf_model(fireredVADContext* ctx, const char* model_path) {
     if (meta_ctx) {
         ggml_free(meta_ctx);
     }
+    
+    // Initialize graph allocator
+    ctx->allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
     
     std::cout << "[firered VAD] Model loaded successfully" << std::endl;
     return true;
@@ -463,29 +474,25 @@ static std::vector<float> preprocess_audio(
     int input_sample_rate,
     int target_sample_rate
 ) {
-    // TODO: Implement resampling if input_sample_rate != target_sample_rate
-    // For now, assume audio is already 16kHz
+    std::vector<float> result;
     
     if (input_sample_rate != target_sample_rate) {
-        std::cerr << "[firered VAD] WARNING: Resampling not implemented. "
-                  << "Expected " << target_sample_rate << " Hz, got " << input_sample_rate << " Hz"
-                  << std::endl;
-    }
-    
-    // Copy and normalize audio
-    std::vector<float> result(audio, audio + n_samples);
-    
-    // Find max amplitude
-    float max_amp = 0.0f;
-    for (float sample : result) {
-        max_amp = std::max(max_amp, std::abs(sample));
-    }
-    
-    // Normalize to [-1, 1] if needed
-    if (max_amp > 1.0f) {
-        for (float& sample : result) {
-            sample /= max_amp;
+        // Linear interpolation resampling
+        double ratio = static_cast<double>(input_sample_rate) / target_sample_rate;
+        int target_samples = static_cast<int>(n_samples / ratio);
+        result.resize(target_samples);
+        
+        for (int i = 0; i < target_samples; i++) {
+            double src_idx = i * ratio;
+            int idx1 = static_cast<int>(src_idx);
+            int idx2 = std::min(idx1 + 1, n_samples - 1);
+            float frac = static_cast<float>(src_idx - idx1);
+            
+            result[i] = audio[idx1] * (1.0f - frac) + audio[idx2] * frac;
         }
+    } else {
+        // Copy audio directly
+        result.assign(audio, audio + n_samples);
     }
     
     return result;
@@ -499,8 +506,8 @@ static struct ggml_tensor* apply_fsmn_layer(
     struct ggml_tensor* lookback_filter,   // Shape: (hidden_dim, 1, lookback_order)
     struct ggml_tensor* lookahead_filter   // Shape: (hidden_dim, 1, lookahead_order) or nullptr
 ) {
-    int n_frames = input->ne[1];
-    int hidden_dim = input->ne[0];
+    int n_frames = static_cast<int>(input->ne[1]);
+    int hidden_dim = static_cast<int>(input->ne[0]);
     
     // FSMN operation:
     // 1. Transpose input to (1, hidden_dim, n_frames) for conv1d
@@ -513,7 +520,7 @@ static struct ggml_tensor* apply_fsmn_layer(
     x_reshaped = ggml_reshape_3d(ctx_compute, x_reshaped, n_frames, hidden_dim, 1);
     
     // Apply lookback convolution (grouped conv1d)
-    int lookback_order = lookback_filter->ne[0];
+    int lookback_order = static_cast<int>(lookback_filter->ne[0]);
     
     // Pad left for lookback (past context) on ne[0]
     struct ggml_tensor* x_padded = ggml_pad_ext(ctx_compute, x_reshaped, lookback_order - 1, 0, 0, 0, 0, 0, 0, 0);
@@ -530,7 +537,7 @@ static struct ggml_tensor* apply_fsmn_layer(
     struct ggml_tensor* result = ggml_add(ctx_compute, input, lookback_out);
     
     if (lookahead_filter != nullptr) {
-        int lookahead_order = lookahead_filter->ne[0];
+        int lookahead_order = static_cast<int>(lookahead_filter->ne[0]);
         
         // Pad right for lookahead (future context) on ne[0]
         struct ggml_tensor* x_padded_ahead = ggml_pad_ext(ctx_compute, x_reshaped, 0, lookahead_order - 1, 0, 0, 0, 0, 0, 0);
@@ -581,19 +588,18 @@ static float run_firered_inference(
     const float* features,
     int n_frames,
     fireredAEDResult* aed_result = nullptr,
-    float* out_probs = nullptr
-) {
+    float* out_probs = nullptr) {
     if (!ctx->ctx_model) {
         set_error("Model not loaded");
         return 0.0f;
     }
     
-    // Allocate enough memory for compute graph
-    size_t compute_size = 1024 * 1024 * 1024ULL;  // 1024 MB for DFSMN
+    // Allocate memory for compute graph metadata only (tensors allocated via gallocr on backend)
+    size_t compute_size = ggml_tensor_overhead() * 2048;
     struct ggml_init_params params = {
         /* .mem_size = */ compute_size,
         /* .mem_buffer = */ nullptr,
-        /* .no_alloc = */ false,
+        /* .no_alloc = */ true,
     };
     struct ggml_context* ctx_compute = ggml_init(params);
     if (!ctx_compute) {
@@ -601,26 +607,14 @@ static float run_firered_inference(
         return 0.0f;
     }
     
-    // Build DFSMN forward pass compute graph
+    // ---- Build DFSMN forward pass compute graph ----
     
-    // 1. Create input tensor: (n_frames, 80)
-    struct ggml_tensor* x = ggml_new_tensor_2d(ctx_compute, GGML_TYPE_F32, ctx->feature_dim, n_frames);
+    // 1. Input tensor: (feature_dim, n_frames) in ggml column-major
+    struct ggml_tensor* inp = ggml_new_tensor_2d(ctx_compute, GGML_TYPE_F32, ctx->feature_dim, n_frames);
+    ggml_set_input(inp);
+    ggml_set_name(inp, "input_features");
     
-    // Copy features and apply CMVN if available
-    float* tensor_data = (float*)x->data;
-    if (!ctx->cmvn_mean.empty() && !ctx->cmvn_std.empty() && ctx->cmvn_mean.size() == ctx->feature_dim) {
-        for (int i = 0; i < n_frames; i++) {
-            for (int j = 0; j < ctx->feature_dim; j++) {
-                tensor_data[i * ctx->feature_dim + j] = 
-                    (features[i * ctx->feature_dim + j] - ctx->cmvn_mean[j]) / ctx->cmvn_std[j];
-            }
-        }
-    } else {
-        memcpy(tensor_data, features, n_frames * ctx->feature_dim * sizeof(float));
-    }
-    
-    // End of CMVN processing
-    ggml_set_name(x, "input_features");
+    struct ggml_tensor* x = inp;
     
     // 2. FC1: (80 → 256) with ReLU
     x = ggml_mul_mat(ctx_compute, ctx->model.fc1_weight, x);
@@ -653,27 +647,50 @@ static float run_firered_inference(
     // 7. Output layer: (128 → n_classes) with Sigmoid
     x = ggml_mul_mat(ctx_compute, ctx->model.out_weight, x);
     x = ggml_add(ctx_compute, x, ctx->model.out_bias);
-    ggml_set_name(x, "pre_sigmoid");
     x = ggml_sigmoid(ctx_compute, x);
     ggml_set_name(x, "output");
+    ggml_set_output(x);
+    struct ggml_tensor* out = x;  // stable reference to output node
     
-    // Build forward pass graph
+    // Build and execute the forward pass graph
     struct ggml_cgraph* gf = ggml_new_graph(ctx_compute);
-    ggml_build_forward_expand(gf, x);
+    ggml_build_forward_expand(gf, out);
+    
+    // Allocate tensors on the backend using gallocr
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        set_error("Failed to allocate graph buffers using ggml_gallocr");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx_compute);
+        return 0.0f;
+    }
+    
+    // Copy features and apply CMVN normalization directly into the allocated backend tensor
+    if (!ctx->cmvn_mean.empty() && !ctx->cmvn_std.empty() && ctx->cmvn_mean.size() == (size_t)ctx->feature_dim) {
+        std::vector<float> cmvn_buf(n_frames * ctx->feature_dim);
+        for (int i = 0; i < n_frames; i++) {
+            for (int j = 0; j < ctx->feature_dim; j++) {
+                cmvn_buf[i * ctx->feature_dim + j] =
+                    (features[i * ctx->feature_dim + j] - ctx->cmvn_mean[j]) / ctx->cmvn_std[j];
+            }
+        }
+        ggml_backend_tensor_set(inp, cmvn_buf.data(), 0, cmvn_buf.size() * sizeof(float));
+    } else {
+        ggml_backend_tensor_set(inp, features, 0, n_frames * ctx->feature_dim * sizeof(float));
+    }
     
     // Execute compute graph on backend
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         set_error("Failed to compute DFSMN inference graph");
+        ggml_gallocr_free(allocr);
         ggml_free(ctx_compute);
         return 0.0f;
     }
     
     // Read result based on mode
     // Output shape: (n_frames, n_classes)
-    // We'll average over all frames for now (can be changed for frame-level output)
-    
     std::vector<float> output_data(n_frames * ctx->n_classes);
-    memcpy(output_data.data(), x->data, output_data.size() * sizeof(float));
+    ggml_backend_tensor_get(out, output_data.data(), 0, output_data.size() * sizeof(float));
     
     // Output mapping based on mode
     if (ctx->mode == fireredVADMode::AED && aed_result && ctx->n_classes == 3) {
@@ -795,15 +812,11 @@ float firered_vad_detect(
         return -1.0f;
     }
     
-    // Resample if necessary (for now, just check and warn)
-    if (sample_rate_hz != ctx->config.sample_rate_hz) {
-        std::cerr << "[firered VAD] WARNING: Sample rate mismatch. "
-                  << "Expected " << ctx->config.sample_rate_hz << " Hz, got " 
-                  << sample_rate_hz << " Hz. Resampling not implemented yet." << std::endl;
-    }
+    // Preprocess (resample if needed)
+    auto processed_audio = preprocess_audio(audio_samples, n_samples, sample_rate_hz, ctx->config.sample_rate_hz);
     
     // Extract Fbank features
-    auto features = ctx->fbank_extractor->ExtractFeatures(audio_samples, n_samples);
+    auto features = ctx->fbank_extractor->ExtractFeatures(processed_audio.data(), static_cast<int>(processed_audio.size()));
     
     if (features.empty()) {
         std::cerr << "[firered VAD] WARNING: No features extracted (audio too short?)" << std::endl;
@@ -811,9 +824,6 @@ float firered_vad_detect(
     }
     
     int n_frames = static_cast<int>(features.size() / ctx->feature_dim);
-    
-    // Features are already flat
-    // Run DFSMN inference
     
     // Run DFSMN inference
     float prob = run_firered_inference(ctx, features.data(), n_frames);
@@ -833,13 +843,11 @@ bool firered_vad_detect_frames(
         return false;
     }
     
-    // Resample if necessary
-    if (sample_rate_hz != ctx->config.sample_rate_hz) {
-        std::cerr << "[firered VAD] WARNING: Sample rate mismatch." << std::endl;
-    }
+    // Preprocess (resample if needed)
+    auto processed_audio = preprocess_audio(audio_samples, n_samples, sample_rate_hz, ctx->config.sample_rate_hz);
     
     // Extract Fbank features
-    auto features = ctx->fbank_extractor->ExtractFeatures(audio_samples, n_samples);
+    auto features = ctx->fbank_extractor->ExtractFeatures(processed_audio.data(), static_cast<int>(processed_audio.size()));
     
     if (features.empty()) {
         frame_probabilities.clear();
@@ -1020,11 +1028,25 @@ const char* firered_vad_get_metadata(fireredVADContext* ctx, const char* key) {
         return nullptr;
     }
     
-    // TODO: Return actual metadata from GGUF
-    if (std::strcmp(key, "model.version") == 0) {
-        return "1.0";  // Placeholder
-    } else if (std::strcmp(key, "model.language") == 0) {
-        return "multilingual";  // Placeholder
+    // Read from GGUF KV store directly
+    if (ctx->gguf_ctx) {
+        int64_t idx = gguf_find_key(ctx->gguf_ctx, key);
+        if (idx >= 0) {
+            // Only return string-valued keys
+            gguf_type ktype = gguf_get_kv_type(ctx->gguf_ctx, idx);
+            if (ktype == GGUF_TYPE_STRING) {
+                return gguf_get_val_str(ctx->gguf_ctx, idx);
+            }
+        }
+    }
+    
+    // Fallback: pre-populated fields
+    if (std::strcmp(key, "model.version") == 0 && !ctx->model_version.empty()) {
+        return ctx->model_version.c_str();
+    } else if (std::strcmp(key, "model.language") == 0 && !ctx->model_language.empty()) {
+        return ctx->model_language.c_str();
+    } else if (std::strcmp(key, "general.architecture") == 0 && !ctx->architecture.empty()) {
+        return ctx->architecture.c_str();
     }
     
     return nullptr;
