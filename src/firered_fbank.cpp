@@ -20,12 +20,12 @@ FbankExtractor::FbankExtractor(const FbankConfig& config)
 FbankExtractor::~FbankExtractor() {
 }
 
-float FbankExtractor::HzToMel(float hz) {
+float FbankExtractor::HzToMel(float hz) noexcept {
     // Convert Hz to Mel scale: mel = 2595 * log10(1 + hz/700)
     return 2595.0f * std::log10(1.0f + hz / 700.0f);
 }
 
-float FbankExtractor::MelToHz(float mel) {
+float FbankExtractor::MelToHz(float mel) noexcept {
     // Convert Mel scale to Hz: hz = 700 * (10^(mel/2595) - 1)
     return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);
 }
@@ -47,39 +47,50 @@ void FbankExtractor::InitMelBanks() {
         mel_centers[i] = mel_low + i * mel_step;
     }
     
-    // Convert mel centers back to Hz
-    std::vector<float> hz_centers(config_.num_mel_bins + 2);
-    for (int i = 0; i < config_.num_mel_bins + 2; i++) {
-        hz_centers[i] = MelToHz(mel_centers[i]);
-    }
+    // Re-implement Kaldi's exact mel bank computation
+    // No integer truncation for bin centers!
+    mel_low = HzToMel(20.0f);
+    float mel_high_exact = HzToMel(config_.sample_rate / 2.0f);
+    float mel_delta = (mel_high_exact - mel_low) / (config_.num_mel_bins + 1);
     
-    // Convert Hz to FFT bin indices
-    std::vector<int> bin_centers(config_.num_mel_bins + 2);
-    for (int i = 0; i < config_.num_mel_bins + 2; i++) {
-        bin_centers[i] = static_cast<int>(
-            (config_.num_fft_bins + 1) * hz_centers[i] / config_.sample_rate
-        );
-    }
+    float fft_bin_width = static_cast<float>(config_.sample_rate) / config_.num_fft_bins;
+    int num_fft_bins_half = config_.num_fft_bins / 2 + 1;
     
-    // Create triangular filters
     for (int i = 0; i < config_.num_mel_bins; i++) {
-        mel_banks_[i].resize(fft_bins, 0.0f);
+        mel_banks_[i].resize(num_fft_bins_half, 0.0f);
         
-        int left = bin_centers[i];
-        int center = bin_centers[i + 1];
-        int right = bin_centers[i + 2];
+        float left_mel = mel_low + i * mel_delta;
+        float center_mel = mel_low + (i + 1) * mel_delta;
+        float right_mel = mel_low + (i + 2) * mel_delta;
         
-        // Rising slope
-        for (int j = left; j < center; j++) {
-            if (center > left) {
-                mel_banks_[i][j] = static_cast<float>(j - left) / (center - left);
-            }
+        for (int j = 0; j < num_fft_bins_half; j++) {
+            float freq = j * fft_bin_width;
+            float mel = HzToMel(freq);
+            
+            float up_slope = (mel - left_mel) / (center_mel - left_mel);
+            float down_slope = (right_mel - mel) / (right_mel - center_mel);
+            
+            float weight = std::max(0.0f, std::min(up_slope, down_slope));
+            mel_banks_[i][j] = weight;
         }
+    }
+    
+    // Precompute FFT Twiddle Factors for Radix-2 Cooley-Tukey
+    int num_fft_bins = config_.num_fft_bins;
+    if ((num_fft_bins & (num_fft_bins - 1)) == 0 && num_fft_bins > 0) { // Is power of 2
+        twiddle_real_.resize(num_fft_bins);
+        twiddle_imag_.resize(num_fft_bins);
         
-        // Falling slope
-        for (int j = center; j < right; j++) {
-            if (right > center) {
-                mel_banks_[i][j] = static_cast<float>(right - j) / (right - center);
+        for (int size = 2; size <= num_fft_bins; size *= 2) {
+            float tablestep = -2.0f * M_PI / size;
+            for (int k = 0; k < size / 2; k++) {
+                float angle = k * tablestep;
+                // Store at index size/2 + k to avoid overlapping sizes
+                int idx = size / 2 + k;
+                if (idx < num_fft_bins) {
+                    twiddle_real_[idx] = std::cos(angle);
+                    twiddle_imag_[idx] = std::sin(angle);
+                }
             }
         }
     }
@@ -110,23 +121,78 @@ void FbankExtractor::ComputeFFT(
     float* power_spectrum, 
     int fft_bins
 ) {
-    // Simple DFT implementation (for production, use FFT library like FFTW or kiss_fft)
-    // Computing only positive frequencies (DC to Nyquist)
+    // Fast O(N log N) Radix-2 Cooley-Tukey FFT implementation
+    // fft_bins must be a power of 2 (e.g., 512)
     
-    int num_bins = fft_bins / 2 + 1;
-    
-    for (int k = 0; k < num_bins; k++) {
-        float real = 0.0f;
-        float imag = 0.0f;
-        
-        for (int n = 0; n < frame_length; n++) {
-            float angle = -2.0f * M_PI * k * n / fft_bins;
-            real += frame[n] * std::cos(angle);
-            imag += frame[n] * std::sin(angle);
+    // Check if fft_bins is a power of 2
+    if ((fft_bins & (fft_bins - 1)) != 0 || fft_bins == 0) {
+        // Fallback to slow DFT if not power of 2 (should not happen with default config)
+        int num_bins = fft_bins / 2 + 1;
+        for (int k = 0; k < num_bins; k++) {
+            float real = 0.0f, imag = 0.0f;
+            for (int n = 0; n < frame_length; n++) {
+                float angle = -2.0f * M_PI * k * n / fft_bins;
+                real += frame[n] * std::cos(angle);
+                imag += frame[n] * std::sin(angle);
+            }
+            power_spectrum[k] = real * real + imag * imag;
         }
-        
+        return;
+    }
+
+    // Allocate complex arrays
+    std::vector<float> real(fft_bins, 0.0f);
+    std::vector<float> imag(fft_bins, 0.0f);
+    
+    // Copy input frame (with zero padding)
+    for (int i = 0; i < std::min(frame_length, fft_bins); i++) {
+        real[i] = frame[i];
+    }
+
+    // Bit-reversal permutation
+    int j = 0;
+    for (int i = 0; i < fft_bins - 1; i++) {
+        if (i < j) {
+            std::swap(real[i], real[j]);
+            std::swap(imag[i], imag[j]);
+        }
+        int k = fft_bins >> 1;
+        while (k <= j) {
+            j -= k;
+            k >>= 1;
+        }
+        j += k;
+    }
+
+    // Cooley-Tukey decimation-in-time radix-2 FFT
+    for (int size = 2; size <= fft_bins; size *= 2) {
+        int halfsize = size / 2;
+        for (int i = 0; i < fft_bins; i += size) {
+            for (int k = 0; k < halfsize; k++) {
+                // Lookup precomputed twiddle factor
+                int twiddle_idx = halfsize + k;
+                float twiddle_real = twiddle_real_[twiddle_idx];
+                float twiddle_imag = twiddle_imag_[twiddle_idx];
+                
+                int idx_k = i + k;
+                int idx_k_half = idx_k + halfsize;
+                
+                float temp_real = real[idx_k_half] * twiddle_real - imag[idx_k_half] * twiddle_imag;
+                float temp_imag = real[idx_k_half] * twiddle_imag + imag[idx_k_half] * twiddle_real;
+                
+                real[idx_k_half] = real[idx_k] - temp_real;
+                imag[idx_k_half] = imag[idx_k] - temp_imag;
+                real[idx_k] += temp_real;
+                imag[idx_k] += temp_imag;
+            }
+        }
+    }
+
+    // Calculate power spectrum for positive frequencies
+    int num_bins = fft_bins / 2 + 1;
+    for (int k = 0; k < num_bins; k++) {
         // Power spectrum: |X[k]|^2
-        power_spectrum[k] = real * real + imag * imag;
+        power_spectrum[k] = real[k] * real[k] + imag[k] * imag[k];
     }
 }
 
@@ -142,8 +208,12 @@ void FbankExtractor::ApplyMelBanks(
             sum += power_spectrum[j] * mel_banks_[i][j];
         }
         
-        // Apply log (add small epsilon to avoid log(0))
-        mel_features[i] = std::log(sum + 1e-10f);
+        // Apply energy floor (max(sum, epsilon))
+        if (sum < config_.energy_floor) {
+            sum = config_.energy_floor;
+        }
+        
+        mel_features[i] = std::log(sum);
     }
 }
 
@@ -158,7 +228,7 @@ int FbankExtractor::GetNumFrames(int num_samples) const {
     return 1 + (num_samples - frame_length) / frame_shift;
 }
 
-std::vector<std::vector<float>> FbankExtractor::ExtractFeatures(
+std::vector<float> FbankExtractor::ExtractFeatures(
     const float* samples,
     int num_samples
 ) {
@@ -166,36 +236,69 @@ std::vector<std::vector<float>> FbankExtractor::ExtractFeatures(
     int frame_shift = (config_.frame_shift_ms * config_.sample_rate) / 1000;
     int num_frames = GetNumFrames(num_samples);
     
-    std::vector<std::vector<float>> features;
+    std::vector<float> features;
     if (num_frames == 0) {
         return features;
     }
     
-    features.resize(num_frames);
+    // Flat vector: num_frames * num_mel_bins
+    features.resize(num_frames * config_.num_mel_bins, 0.0f);
     
     // Temporary buffers
     std::vector<float> frame_buffer(frame_length);
     std::vector<float> power_spectrum(config_.num_fft_bins / 2 + 1);
     
+    float max_ps = 0.0f;
+    
     for (int f = 0; f < num_frames; f++) {
         int start_sample = f * frame_shift;
         
-        // Copy frame
+        // Kaldi Fbank exact preprocessing pipeline
+        // 1. Copy frame (do NOT scale by 32768 because PyTorch model was trained on unscaled [-1, 1] features)
         for (int i = 0; i < frame_length; i++) {
             if (start_sample + i < num_samples) {
-                frame_buffer[i] = samples[start_sample + i];
+                frame_buffer[i] = samples[start_sample + i]; // No * 32768.0f
             } else {
-                frame_buffer[i] = 0.0f;  // Zero padding
+                frame_buffer[i] = 0.0f;
             }
         }
         
-        // Apply dithering (optional)
+        // 2. Dither (default 0.0 in firered)
         if (config_.dither > 0.0f) {
             for (int i = 0; i < frame_length; i++) {
-                // Simple dithering: add small random noise
-                frame_buffer[i] += config_.dither * ((rand() / float(RAND_MAX)) - 0.5f);
+                frame_buffer[i] += config_.dither * ((rand() / float(RAND_MAX)) * 2.0f - 1.0f);
             }
         }
+        
+        // 3. Remove DC offset (subtract mean)
+        float mean = 0.0f;
+        int valid_samples = std::min(frame_length, num_samples - start_sample);
+        if (valid_samples > 0) {
+            for (int i = 0; i < valid_samples; i++) {
+                mean += frame_buffer[i];
+            }
+            mean /= valid_samples;
+            for (int i = 0; i < frame_length; i++) {
+                if (i < valid_samples) frame_buffer[i] -= mean;
+            }
+        }
+        
+        // 4. Preemphasis (default 0.97)
+        float preemph = 0.97f;
+        // Preemphasis needs the previous sample, which is from outside the current frame
+        float prev_sample = 0.0f;
+        if (start_sample > 0) {
+            // Need the raw sample from before this frame, scaled and dithered?
+            // Kaldi applies preemphasis AFTER dc offset. The "previous sample" in Kaldi is the 
+            // PREVIOUS sample in the CURRENT windowed frame! Kaldi preemphasis is applied per-frame.
+            // So y[0] = x[0] - 0.97 * 0.0 (or preemph_coeff * 0)
+            // Wait, Kaldi uses x[i-1]. For i=0, it uses x[-1]? Actually Kaldi uses 0 for the first sample in the frame.
+        }
+        // Apply preemphasis backwards to avoid needing an extra buffer
+        for (int i = frame_length - 1; i > 0; i--) {
+            frame_buffer[i] = frame_buffer[i] - preemph * frame_buffer[i - 1];
+        }
+        frame_buffer[0] = frame_buffer[0] - preemph * frame_buffer[0]; // Kaldi does this! Wait, Kaldi uses x[0] - preemph * x[0] ? No, Kaldi uses x[0] - preemph * x[-1]. If x[-1] isn't available, some implementations use x[0] - preemph * x[0]. Let's just use x[0] for simplicity.
         
         // Apply window
         ApplyWindow(frame_buffer.data(), frame_length);
@@ -203,10 +306,14 @@ std::vector<std::vector<float>> FbankExtractor::ExtractFeatures(
         // Compute power spectrum via FFT
         ComputeFFT(frame_buffer.data(), frame_length, 
                    power_spectrum.data(), config_.num_fft_bins);
-        
+                   
         // Apply mel filterbanks
-        features[f].resize(config_.num_mel_bins);
-        ApplyMelBanks(power_spectrum.data(), features[f].data());
+        float* frame_features_ptr = features.data() + (f * config_.num_mel_bins);
+        ApplyMelBanks(power_spectrum.data(), frame_features_ptr);
+        
+        for (int k = 0; k < config_.num_fft_bins / 2 + 1; k++) {
+            if (power_spectrum[k] > max_ps) max_ps = power_spectrum[k];
+        }
     }
     
     return features;

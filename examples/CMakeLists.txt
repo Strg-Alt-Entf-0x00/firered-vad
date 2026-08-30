@@ -23,4 +23,24 @@ install(TARGETS test_cpp_inference
     RUNTIME DESTINATION bin
 )
 
-message(STATUS "Example programs configured: test_cpp_inference")
+# Test with real audio files
+add_executable(test_audio_file test_audio_file.cpp)
+
+target_link_libraries(test_audio_file 
+    PRIVATE 
+        FireRed::vad
+)
+
+target_compile_features(test_audio_file PRIVATE cxx_std_20)
+
+if(MSVC)
+    target_compile_options(test_audio_file PRIVATE /W4)
+else()
+    target_compile_options(test_audio_file PRIVATE -Wall -Wextra)
+endif()
+
+install(TARGETS test_audio_file
+    RUNTIME DESTINATION bin
+)
+
+message(STATUS "Example programs configured: test_cpp_inference, test_audio_file")

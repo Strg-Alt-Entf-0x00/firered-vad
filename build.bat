@@ -53,14 +53,11 @@ echo [1/3] Configuring with CMake...
 echo [LOG] %LOG%
 
 cmake -B %BUILD_DIR% -S . ^
-    -G "%VS_GENERATOR%" ^
-    -T host=x64 ^
     -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
     -DCMAKE_INSTALL_PREFIX=%INSTALL_PREFIX% ^
-    -DCMAKE_VS_GLOBALS="PreferredUILang=en-US" ^
-    -DFireRed_VAD_BUILD_TESTS=OFF ^
-    -DFireRed_VAD_BUILD_EXAMPLES=OFF ^
-    -DFireRed_VAD_USE_CUDA=ON > "%LOG%" 2>&1
+    -Dfirered_vad_BUILD_TESTS=OFF ^
+    -Dfirered_vad_BUILD_EXAMPLES=ON ^
+    -Dfirered_vad_USE_CUDA=OFF > "%LOG%" 2>&1
 
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] CMake configuration failed. Check %LOG%

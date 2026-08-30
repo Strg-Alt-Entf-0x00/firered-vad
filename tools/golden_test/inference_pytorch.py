@@ -145,12 +145,15 @@ class FireRedVADPyTorch:
         dnn_bias = torch.from_numpy(self.weights['dfsmn.dnns.0.bias']).float()
         x = torch.matmul(x, dnn_weight.T) + dnn_bias
         x = torch.relu(x)
+        print(f"[PyTorch DEBUG] After DNN: shape={x.shape}, mean={x.mean():.6f}, first_frame_mean={x[0].mean():.6f}")
         
         # Layer 12: Output layer
         out_weight = torch.from_numpy(self.weights['out.weight']).float()
         out_bias = torch.from_numpy(self.weights['out.bias']).float()
         x = torch.matmul(x, out_weight.T) + out_bias
+        print(f"[PyTorch DEBUG] Pre-sigmoid: shape={x.shape}, mean={x.mean():.6f}, first_frame={x[0,0]:.6f}")
         x = torch.sigmoid(x)
+        print(f"[PyTorch DEBUG] Post-sigmoid: shape={x.shape}, mean={x.mean():.6f}, first_frame={x[0,0]:.6f}")
         
         return x.numpy()
     

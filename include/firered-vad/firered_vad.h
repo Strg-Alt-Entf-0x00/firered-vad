@@ -1,12 +1,12 @@
-// firered_vad.h - firered Voice Activity Detection
+// firered_vad.h - FireRed Voice Activity Detection
 // State-of-the-Art ML-based VAD for ASR Preprocessing
-// 
-// Architecture: RNN-based (LSTM)
-// Input: 16kHz mono audio (float32)
-// Output: Speech probability per 30ms frame (0.0 = silence, 1.0 = speech)
 //
-// License: MIT (firered Models)
-// Reference: https://github.com/snakers4/firered-models
+// Architecture: DFSMN (Deep Feed-Forward Sequential Memory Network)
+// Input: 16kHz mono audio (float32)
+// Output: Speech probability per 10ms hop (0.0 = silence, 1.0 = speech)
+//
+// License: Apache 2.0
+// Reference: https://huggingface.co/FireRedTeam/FireRedVAD
 
 #pragma once
 
@@ -46,7 +46,7 @@ struct fireredAEDResult {
 /// @brief Configuration for firered VAD
 struct fireredVADConfig {
     int sample_rate_hz = 16000;       ///< Input sample rate (16kHz required)
-    int frame_size_ms = 30;           ///< Frame size in milliseconds (firered: 30ms, NOT 20ms)
+    int frame_size_ms = 25;           ///< Frame size in milliseconds (firered uses 25ms)
     int hop_size_ms = 10;             ///< Hop size in milliseconds
     float threshold = 0.5f;           ///< Speech probability threshold
     int n_threads = 4;                ///< Number of threads for inference
@@ -157,11 +157,11 @@ fireredAEDResult firered_aed_detect(
     int sample_rate_hz
 );
 
-/// @brief Reset RNN state (for new audio stream)
-/// 
-/// Call this when starting a new audio stream to clear RNN memory.
-/// Important for accurate VAD when processing multiple independent audio files.
-/// 
+/// @brief Reset state (for new audio stream)
+///
+/// DFSMN is stateless, so this is a no-op. Kept for API compatibility
+/// in case future models require state management.
+///
 /// @param ctx firered context
 void firered_vad_reset(fireredVADContext* ctx);
 
@@ -246,7 +246,7 @@ public:
     /// @brief Detect audio events frame-by-frame (AED mode only)
     std::vector<fireredAEDResult> detect_aed_frames(const std::vector<float>& audio, int sample_rate_hz = 16000);
 
-    /// @brief Reset RNN state for new audio stream
+    /// @brief Reset state for new audio stream (no-op for DFSMN)
     void reset();
 
     /// @brief Get current operating mode

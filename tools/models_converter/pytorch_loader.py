@@ -115,6 +115,14 @@ class PyTorchModelLoader:
                     else:
                         # Unsupported type, skip
                         continue
+                    
+                    # For lookahead filters, we need to reverse the time axis
+                    # because GGML's conv1d_dw is cross-correlation, and FSMN lookahead
+                    # mathematically needs a reversed kernel to correctly slide into the future.
+                    if 'lookahead' in name:
+                        # shape is (channels, 1, kernel_size)
+                        weights[name] = np.ascontiguousarray(weights[name][:, :, ::-1])
+
                 except Exception as e:
                     print(f"  Warning: Failed to convert tensor '{name}': {e}")
                     continue
@@ -140,20 +148,18 @@ class PyTorchModelLoader:
         """
         Load CMVN (Cepstral Mean and Variance Normalization) statistics
         
-        CMVN statistics are stored in Kaldi binary .ark format:
-        - Header: '\x00BDM ' (5 bytes)
-        - Format info: 4 bytes  
-        - Dimension marker + size (e.g., '\x04Q\x00\x00\x00' for 81-dim)
-        - Float data: mean and variance vectors
+        Kaldi stores CMVN as statistics matrix in binary format:
+        - Header: 15 bytes (BDM header + format markers)
+        - Data: 2x81 matrix of float64 (double precision)
+        - Row 0: sum of features (80) + frame count (1)
+        - Row 1: sum of squares (80) + 0.0 (1)
         
-        FireRed-VAD stores 81 dimensions (80 Fbank + 1 for frame count)
-        We extract the first 80 dimensions for mean and variance.
+        We convert stats to mean and variance:
+        - mean = sum / count
+        - variance = (sum_squares / count) - mean²
         
         Returns:
-            Tuple of (mean, variance) arrays, shape (80,)
-            
-        Raises:
-            RuntimeError: If CMVN parsing fails
+            Tuple of (mean, variance) arrays, shape (80,) as float32
         """
         try:
             with open(self.cmvn_path, 'rb') as f:
@@ -161,52 +167,39 @@ class PyTorchModelLoader:
             
             print(f"  CMVN file size: {len(content)} bytes")
             
-            # Parse Kaldi binary format
-            offset = 0
+            # Validate file size (15 byte header + 2*81*8 bytes data = 1311 bytes)
+            expected_size = 15 + 2 * 81 * 8
+            if len(content) != expected_size:
+                raise RuntimeError(f"Unexpected file size: {len(content)}, expected {expected_size}")
             
-            # Check header: '\x00BDM '
-            if content[offset:offset+5] != b'\x00BDM ':
-                raise RuntimeError(f"Invalid Kaldi header: {content[offset:offset+5]}")
-            offset += 5
+            # Kaldi binary format: 15 byte header, then 2x81 float64 matrix
+            offset = 15
+            n_values = 2 * 81
             
-            # Skip format info (5 bytes: \x04\x02\x00\x00\x00)
-            offset += 5
+            # Read as float64 (double precision)
+            doubles = struct.unpack(f'<{n_values}d', content[offset:offset+n_values*8])
+            matrix = np.array(doubles, dtype=np.float64).reshape(2, 81)
             
-            # Read dimension marker and size
-            # Format: '\x04' (marker) + 4-byte little-endian uint32
-            if content[offset] != 0x04:
-                raise RuntimeError(f"Expected dimension marker 0x04, got {content[offset]:02x}")
-            offset += 1
+            # Extract statistics
+            feature_sum = matrix[0, :80]
+            feature_sumsq = matrix[1, :80]
+            frame_count = matrix[0, 80]
             
-            dim = struct.unpack('<I', content[offset:offset+4])[0]
-            offset += 4
-            print(f"  CMVN dimensions: {dim}")
+            print(f"  Frame count: {frame_count:.0f}")
             
-            if dim != 81:
-                print(f"  Warning: Expected 81 dimensions, got {dim}")
+            if frame_count <= 0:
+                raise RuntimeError(f"Invalid frame count: {frame_count}")
             
-            # Read float data (mean vector)
-            mean_size = dim * 4  # 4 bytes per float32
-            mean_data = struct.unpack(f'<{dim}f', content[offset:offset+mean_size])
-            mean = np.array(mean_data[:80], dtype=np.float32)  # Take first 80
-            offset += mean_size
+            # Compute mean and variance from statistics
+            mean = feature_sum / frame_count
+            variance = (feature_sumsq / frame_count) - (mean * mean)
             
-            # Read dimension marker again for variance
-            if content[offset] != 0x04:
-                raise RuntimeError(f"Expected dimension marker 0x04 for variance, got {content[offset]:02x}")
-            offset += 1
+            # Ensure variance is positive (numerical stability)
+            variance = np.maximum(variance, 1e-10)
             
-            var_dim = struct.unpack('<I', content[offset:offset+4])[0]
-            offset += 4
-            
-            if var_dim != dim:
-                raise RuntimeError(f"Variance dimension mismatch: {var_dim} != {dim}")
-            
-            # Read float data (variance vector)
-            var_size = var_dim * 4
-            var_data = struct.unpack(f'<{var_dim}f', content[offset:offset+var_size])
-            variance = np.array(var_data[:80], dtype=np.float32)  # Take first 80
-            offset += var_size
+            # Convert to float32
+            mean = mean.astype(np.float32)
+            variance = variance.astype(np.float32)
             
             # Validate
             if not np.all(np.isfinite(mean)):
@@ -214,7 +207,6 @@ class PyTorchModelLoader:
             if not np.all(np.isfinite(variance)):
                 raise RuntimeError("CMVN variance contains invalid values (NaN/Inf)")
             if not np.all(variance > 0):
-                # Find which values are bad
                 bad_indices = np.where(variance <= 0)[0]
                 raise RuntimeError(f"CMVN variance contains non-positive values at indices: {bad_indices}")
             
@@ -225,9 +217,8 @@ class PyTorchModelLoader:
             return mean, variance
                 
         except Exception as e:
-            print(f"  Warning: CMVN parsing failed ({e}), using defaults")
-            # Return default normalization (no effect)
-            return np.zeros(80, dtype=np.float32), np.ones(80, dtype=np.float32)
+            print(f"  ERROR: CMVN loading failed: {e}")
+            raise RuntimeError(f"Failed to load CMVN: {e}")
 
 
 def test_loader():
