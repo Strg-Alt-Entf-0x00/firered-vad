@@ -837,29 +837,41 @@ fireredVADContext* firered_vad_init(const char* model_path, const fireredVADConf
         ctx->config = *config;
     }
     
-    // Auto-detect mode from filename if not explicitly set
-    if (ctx->config.mode == fireredVADMode::Standard && config == nullptr) {
-        ctx->config.mode = detect_mode_from_path(model_path);
+    // Auto-detect mode from filename (always — user can override via config.mode)
+    fireredVADMode detected_mode = detect_mode_from_path(model_path);
+    if (ctx->config.mode == fireredVADMode::Standard) {
+        ctx->config.mode = detected_mode;
     }
     ctx->mode = ctx->config.mode;
     
+    // Auto-enable stateful cache for streaming models (unless user explicitly disabled it)
+    if (ctx->mode == fireredVADMode::Streaming && !ctx->config.enable_cache) {
+        ctx->config.enable_cache = true;
+        std::cout << "[firered VAD] Streaming mode detected — stateful FSMN cache enabled automatically" << std::endl;
+    }
+    
     std::cout << "[firered VAD] Operating mode: " << mode_to_string(ctx->mode) << std::endl;
     
-    // Initialize GGML backend
+    // Initialize GGML backend — auto-detect best available backend
     ggml_backend_load_all();
     
-    if (ctx->config.use_gpu) {
-        // Try CUDA backend first
 #ifdef GGML_USE_CUDA
-        ctx->backend = ggml_backend_cuda_init(0);  // Device 0
-#endif
-        if (!ctx->backend) {
-            std::cerr << "[firered VAD] CUDA not available, falling back to CPU" << std::endl;
-            ctx->backend = ggml_backend_cpu_init();
-        }
+    // Try CUDA first — always prefer GPU when compiled in
+    ctx->backend = ggml_backend_cuda_init(0);  // Device 0
+    if (ctx->backend) {
+        ctx->config.use_gpu = true;
+        std::cout << "[firered VAD] CUDA backend selected (GPU acceleration active)" << std::endl;
     } else {
+        std::cout << "[firered VAD] CUDA init failed — falling back to CPU" << std::endl;
+        ctx->config.use_gpu = false;
         ctx->backend = ggml_backend_cpu_init();
     }
+#else
+    // CPU-only build
+    ctx->config.use_gpu = false;
+    ctx->backend = ggml_backend_cpu_init();
+#endif
+
     
     if (!ctx->backend) {
         set_error("Failed to initialize GGML backend");
@@ -893,7 +905,7 @@ fireredVADContext* firered_vad_init(const char* model_path, const fireredVADConf
     std::cout << "[firered VAD]   Feature dim: " << ctx->feature_dim << std::endl;
     std::cout << "[firered VAD]   Hidden dim: " << ctx->hidden_dim << std::endl;
     std::cout << "[firered VAD]   Output classes: " << ctx->n_classes << std::endl;
-    std::cout << "[firered VAD]   Backend: " << (ctx->config.use_gpu ? "CUDA" : "CPU") << std::endl;
+    std::cout << "[firered VAD]   Backend: " << ggml_backend_name(ctx->backend) << std::endl;
     
     return ctx;
 }

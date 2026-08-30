@@ -67,10 +67,10 @@ struct fireredVADConfig {
     int hop_size_ms = 10;             ///< Hop size in milliseconds
     float threshold = 0.5f;           ///< Speech probability threshold
     int n_threads = 4;                ///< Number of threads for inference
-    bool use_gpu = false;             ///< Use CUDA if available
-    bool enable_cache = true;         ///< Enable stateful cache (auto-detected: true for stream, false for offline)
-    fireredVADMode mode = fireredVADMode::Standard;  ///< Operating mode (auto-detected from model if not set)
-    fireredVADPostProcessConfig post_process; ///< Configuration for VAD post-processing
+    bool use_gpu = false;             ///< [out] True if CUDA backend is active (auto-detected at init, do not set manually)
+    bool enable_cache = false;        ///< Enable stateful FSMN cache for streaming (auto-set to true for stream models)
+    fireredVADMode mode = fireredVADMode::Standard;  ///< Operating mode (auto-detected from model filename if not set)
+    fireredVADPostProcessConfig post_process; ///< Post-processing configuration (smoothing, state machine, merging)
 };
 
 /// @brief Initialize firered VAD from GGUF model
