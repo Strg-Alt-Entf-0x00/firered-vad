@@ -44,3 +44,23 @@ install(TARGETS test_audio_file
 )
 
 message(STATUS "Example programs configured: test_cpp_inference, test_audio_file")
+
+# Test with Live Microphone (WASAPI)
+add_executable(live_mic_test live_mic_test.cpp)
+
+target_link_libraries(live_mic_test 
+    PRIVATE 
+        FireRed::vad
+)
+
+target_compile_features(live_mic_test PRIVATE cxx_std_20)
+
+if(MSVC)
+    target_compile_options(live_mic_test PRIVATE /W4)
+else()
+    target_compile_options(live_mic_test PRIVATE -Wall -Wextra)
+endif()
+
+install(TARGETS live_mic_test
+    RUNTIME DESTINATION bin
+)

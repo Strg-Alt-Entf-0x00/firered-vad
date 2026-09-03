@@ -24,7 +24,7 @@ if errorlevel 1 (
 
 REM Get the directory where this batch file is located
 set "SCRIPT_DIR=%~dp0"
-set "PYTHON_SCRIPT=%SCRIPT_DIR%download_pth_models.py"
+set "PYTHON_SCRIPT=%SCRIPT_DIR%models_downloader\download_pth_models.py"
 
 REM Check if the Python script exists
 if not exist "%PYTHON_SCRIPT%" (
